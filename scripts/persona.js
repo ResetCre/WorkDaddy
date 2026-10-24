@@ -51,10 +51,14 @@ function stateOf(files) {
 }
 function fingerprint(files) { return crypto.createHash('sha256').update(JSON.stringify(files)).digest('hex'); }
 function nonempty(files, name) { return !!(files[name] && files[name].text.trim()); }
-function usableSource(files) {
+function usableSource(files, allowPendingBootstrap) {
   // A partial/template source must never suppress the official onboarding.
-  return ['IDENTITY.md', 'USER.md', 'SOUL.md'].every(name => nonempty(files, name)) &&
-    (!files['BOOTSTRAP.md'] || !!stateOf(files).onboardingCompletedAt);
+  const ready = ['IDENTITY.md', 'USER.md', 'SOUL.md'].every(name => nonempty(files, name));
+  if (!ready) return false;
+  // 用户显式选择分享来源时，允许仍在引导中（BOOTSTRAP.md 未删）的账号；
+  // 自动修复候选仍保持严格，避免拿模板直接覆盖新账号的引导流程。
+  if (allowPendingBootstrap) return true;
+  return !files['BOOTSTRAP.md'] || !!stateOf(files).onboardingCompletedAt;
 }
 function scopedLayout(root) {
   assertSafePath(root);
@@ -147,13 +151,13 @@ function sharedPersonaDir(backupRoot) {
   assertSafePath(dir);
   return dir;
 }
-function listPersonaSources({ dataRoot, accounts = [] }) {
+function listPersonaSources({ dataRoot, accounts = [], allowPendingBootstrap = false }) {
   const sources = [];
   for (const account of [...accounts.filter(a => a.uid !== 'legacy'), { uid: 'legacy', nickname: '升级前共用的设置' }]) {
     const uid = String(account.uid || '');
     if (!validUid(uid)) continue;
     const files = snapshot(uid === 'legacy' ? path.resolve(dataRoot) : personaDir(dataRoot, uid));
-    const available = usableSource(files);
+    const available = usableSource(files, allowPendingBootstrap);
     if (uid === 'legacy' && !available) continue;
     sources.push({ uid, nickname: String(account.nickname || uid), available,
       ...(available ? { files: IDENTITY_FILES.filter(name => nonempty(files, name)), revision: fingerprint(files) }
@@ -172,7 +176,8 @@ function backupPersonaDirectory(backupRoot, label, original) {
 // WorkBuddy can edit the active projection; the switch seam captures it before auth changes.
 function applySharedPersona(options, sourceFiles, settings) {
   const { dataRoot, backupRoot, targetUid } = options;
-  if (!usableSource(sourceFiles)) throw new Error('来源个性化设置尚未完成，请先完成个性化设置');
+  // 共享模式总是用户显式选择来源，这里允许来源仍在引导中。
+  if (!usableSource(sourceFiles, true)) throw new Error('来源个性化设置尚未完成，请先完成个性化设置');
   const targetDir = personaDir(dataRoot, targetUid);
   const sharedDir = sharedPersonaDir(backupRoot);
   const originalTarget = snapshot(targetDir), originalShared = snapshot(sharedDir);
@@ -236,7 +241,7 @@ function configurePersona(options) {
   }
   if (!options.accounts.some(a => String(a.uid) === options.currentUid)) throw new Error('当前账号不存在');
   if (!scopedLayout(options.dataRoot)) throw new Error('当前版本尚未启用独立个性化目录，无需开启共享');
-  const source = listPersonaSources(options).find(a => a.uid === options.sourceUid && a.available);
+  const source = listPersonaSources({ ...options, allowPendingBootstrap: true }).find(a => a.uid === options.sourceUid && a.available);
   if (!source) throw new Error('请选择可用的个性化设置来源');
   if (!options.revision || source.revision !== options.revision) throw new Error('来源个性化设置已变化，请重新选择');
   const sourceDir = source.uid === 'legacy' ? path.resolve(options.dataRoot) : personaDir(options.dataRoot, source.uid);

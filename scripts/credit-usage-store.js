@@ -86,6 +86,44 @@ function createCreditUsageStore(options = {}) {
           synced_at INTEGER NOT NULL, PRIMARY KEY (profile_id, uid, usage_date)
         )
       `);
+      // 5 秒轮询的 IDEA 采样：只在「IDEA 累计值发生变化」时落一行，
+      // 空转不写库，避免 5 秒一条把表撑爆。
+      await db.run(`
+        CREATE TABLE IF NOT EXISTS idea_usage_samples (
+          profile_id TEXT NOT NULL,
+          uid TEXT NOT NULL,
+          captured_at INTEGER NOT NULL,
+          idea_credit REAL NOT NULL DEFAULT 0,
+          desktop_credit REAL NOT NULL DEFAULT 0,
+          total_credit REAL NOT NULL DEFAULT 0,
+          PRIMARY KEY (profile_id, uid, captured_at)
+        )
+      `);
+      await db.run(`
+        CREATE INDEX IF NOT EXISTS idx_idea_usage_samples_uid_at
+        ON idea_usage_samples (profile_id, uid, captured_at)
+      `);
+      // IDE 插件本地会话的逐条用量（来自插件的 history/<workspace>/<conv>/index.json）。
+      // 官方接口不提供 token，这里同时存 credit 与 token，是 IDE 页签的唯一数据源。
+      await db.run(`
+        CREATE TABLE IF NOT EXISTS idea_request_usage (
+          profile_id TEXT NOT NULL,
+          uid TEXT NOT NULL,
+          request_id TEXT NOT NULL,
+          started_at INTEGER NOT NULL,
+          usage_date TEXT NOT NULL,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_tokens INTEGER NOT NULL DEFAULT 0,
+          credit REAL NOT NULL DEFAULT 0,
+          PRIMARY KEY (profile_id, uid, request_id)
+        )
+      `);
+      await db.run(`
+        CREATE INDEX IF NOT EXISTS idx_idea_request_usage_uid_date
+        ON idea_request_usage (profile_id, uid, usage_date)
+      `);
       await db.run(`
         CREATE TABLE IF NOT EXISTS daily_checkin_records (
           profile_id TEXT NOT NULL,
@@ -242,6 +280,191 @@ function createCreditUsageStore(options = {}) {
     return summaries[accountUid] || null;
   }
 
+  // 全部（历史累计）积分消耗：直接汇总 credit_usage_records，与 workbuddy-switch
+  // 「本地统计消耗」思路一致——不依赖官方计费接口，用本机已记录的用量求和。
+  async function totalUsageForUids(uids) {
+    await initialize();
+    const accountUids = Array.from(new Set((Array.isArray(uids) ? uids : []).map((uid) => validIdentity(uid, 'uid'))));
+    if (!accountUids.length) return {};
+    const placeholders = accountUids.map(() => '?').join(',');
+    const rows = await db.all(
+      `SELECT uid, ROUND(SUM(credit), 2) AS total
+       FROM credit_usage_records
+       WHERE profile_id = ? AND uid IN (${placeholders})
+       GROUP BY uid`,
+      [profileId, ...accountUids]
+    );
+    const result = {};
+    for (const row of rows) {
+      const total = Number(row.total);
+      if (!accountUids.includes(row.uid) || !Number.isFinite(total)) continue;
+      result[row.uid] = total;
+    }
+    return result;
+  }
+
+  // 按客户端（WorkBuddy 桌面端 / JetBrainsIntelliJIdea 插件）聚合本地已同步的官方明细。
+  // 官方明细接口只回最近 31 天，IDEA 拆分只能逐日落库后本地累加，这里读的就是累加结果。
+  // today 传入时额外返回当日各客户端小计（供卡片「今日/累计」展示）。
+  async function clientUsageForUids(uids, today) {
+    await initialize();
+    const accountUids = Array.from(new Set((Array.isArray(uids) ? uids : []).map((uid) => validIdentity(uid, 'uid'))));
+    if (!accountUids.length) return {};
+    const placeholders = accountUids.map(() => '?').join(',');
+    const day = today ? validDate(today) : '';
+    const rows = await db.all(
+      `SELECT uid, client, ${day ? 'usage_date = ?' : '0'} AS is_today,
+              ROUND(SUM(credit), 2) AS credit, COUNT(*) AS cnt,
+              MIN(usage_date) AS first_date, MAX(usage_date) AS last_date
+       FROM credit_usage_records
+       WHERE profile_id = ? AND uid IN (${placeholders})
+       GROUP BY uid, client, is_today`,
+      day ? [day, profileId, ...accountUids] : [profileId, ...accountUids]
+    );
+    const result = {};
+    for (const row of rows) {
+      if (!accountUids.includes(row.uid)) continue;
+      const credit = Number(row.credit);
+      if (!Number.isFinite(credit)) continue;
+      const entry = result[row.uid] || (result[row.uid] = {
+        total: 0, count: 0, from: '', to: '', clients: {},
+        today: 0, todayClients: {}, lastSampleAt: 0,
+      });
+      const name = String(row.client || '');
+      entry.total = Math.round((entry.total + credit) * 100) / 100;
+      entry.count += Number(row.cnt) || 0;
+      const first = String(row.first_date || '');
+      const last = String(row.last_date || '');
+      if (first && (!entry.from || first < entry.from)) entry.from = first;
+      if (last && (!entry.to || last > entry.to)) entry.to = last;
+      entry.clients[name] = Math.round(((entry.clients[name] || 0) + credit) * 100) / 100;
+      // is_today 的行既是当日用量，也是总累计的一部分，两边都要累加。
+      if (Number(row.is_today) === 1) {
+        entry.today = Math.round((entry.today + credit) * 100) / 100;
+        entry.todayClients[name] = Math.round(((entry.todayClients[name] || 0) + credit) * 100) / 100;
+      }
+    }
+    const samples = await db.all(
+      `SELECT uid, MAX(captured_at) AS at FROM idea_usage_samples
+       WHERE profile_id = ? AND uid IN (${placeholders}) GROUP BY uid`,
+      [profileId, ...accountUids]
+    );
+    for (const row of samples) {
+      if (result[row.uid]) result[row.uid].lastSampleAt = Number(row.at) || 0;
+    }
+    return result;
+  }
+
+  // 5 秒轮询只补明细，不写覆盖标记（窄窗口并不代表整日已同步）。
+  async function savePolledUsage(uid, records) {
+    await initialize();
+    const accountUid = validIdentity(uid, 'uid');
+    await saveRecords(accountUid, records);
+    try { fs.chmodSync(dbPath, 0o600); } catch (_) {}
+  }
+
+  // 写入 IDE 插件本地会话的逐条用量（request_id 幂等 upsert）。
+  async function saveIdeaRequests(uid, rows) {
+    await initialize();
+    const accountUid = validIdentity(uid, 'uid');
+    const list = Array.isArray(rows) ? rows : [];
+    for (let offset = 0; offset < list.length; offset += 200) {
+      const statements = list.slice(offset, offset + 200).map((row) => ({
+        sql: `INSERT INTO idea_request_usage
+                (profile_id, uid, request_id, started_at, usage_date,
+                 input_tokens, output_tokens, total_tokens, cache_tokens, credit)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(profile_id, uid, request_id) DO UPDATE SET
+                started_at = excluded.started_at, usage_date = excluded.usage_date,
+                input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
+                total_tokens = excluded.total_tokens, cache_tokens = excluded.cache_tokens,
+                credit = excluded.credit`,
+        params: [
+          profileId, accountUid,
+          validIdentity(row.requestId, 'request id'),
+          Number(row.startedAt) || 0,
+          String(row.usageDate || '').slice(0, 10),
+          Number(row.inputTokens) || 0,
+          Number(row.outputTokens) || 0,
+          Number(row.totalTokens) || 0,
+          Number(row.cacheTokens) || 0,
+          Number(row.credit) || 0,
+        ],
+      }));
+      if (statements.length) await db.transaction(statements);
+    }
+    try { fs.chmodSync(dbPath, 0o600); } catch (_) {}
+  }
+
+  // IDE 插件本地会话的汇总（今日/全部，credit + token）。
+  async function ideaUsageSummary(uids, today) {
+    await initialize();
+    const accountUids = Array.from(new Set((Array.isArray(uids) ? uids : []).map((uid) => validIdentity(uid, 'uid'))));
+    if (!accountUids.length) return {};
+    const placeholders = accountUids.map(() => '?').join(',');
+    const day = today ? validDate(today) : '';
+    const rows = await db.all(
+      `SELECT uid, ${day ? 'usage_date = ?' : '0'} AS is_today,
+              ROUND(SUM(credit), 2) AS credit, SUM(total_tokens) AS tokens, COUNT(*) AS cnt,
+              MIN(usage_date) AS first_date, MAX(usage_date) AS last_date
+       FROM idea_request_usage
+       WHERE profile_id = ? AND uid IN (${placeholders})
+       GROUP BY uid, is_today`,
+      day ? [day, profileId, ...accountUids] : [profileId, ...accountUids]
+    );
+    const result = {};
+    for (const row of rows) {
+      if (!accountUids.includes(row.uid)) continue;
+      const credit = Number(row.credit) || 0;
+      const tokens = Number(row.tokens) || 0;
+      const entry = result[row.uid] || (result[row.uid] = {
+        totalCredit: 0, totalTokens: 0, todayCredit: 0, todayTokens: 0,
+        count: 0, from: '', to: '',
+      });
+      entry.totalCredit = Math.round((entry.totalCredit + credit) * 100) / 100;
+      entry.totalTokens += tokens;
+      entry.count += Number(row.cnt) || 0;
+      const first = String(row.first_date || '');
+      const last = String(row.last_date || '');
+      if (first && (!entry.from || first < entry.from)) entry.from = first;
+      if (last && (!entry.to || last > entry.to)) entry.to = last;
+      if (Number(row.is_today) === 1) {
+        entry.todayCredit = Math.round((entry.todayCredit + credit) * 100) / 100;
+        entry.todayTokens += tokens;
+      }
+    }
+    return result;
+  }
+
+  // 记录一次 IDEA 采样；与上一条相同则跳过，只保留「发生变化」的时间点。
+  async function recordIdeaSample({ uid, capturedAt, ideaCredit, desktopCredit, totalCredit }) {
+    await initialize();
+    const accountUid = validIdentity(uid, 'uid');
+    const at = Number(capturedAt);
+    if (!Number.isSafeInteger(at) || at < 0) throw new Error('采样时间无效');
+    const idea = Math.round(Number(ideaCredit || 0) * 100) / 100;
+    const prev = await db.all(
+      `SELECT idea_credit FROM idea_usage_samples
+       WHERE profile_id = ? AND uid = ? ORDER BY captured_at DESC LIMIT 1`,
+      [profileId, accountUid]
+    );
+    if (prev.length && Number(prev[0].idea_credit) === idea) return false;
+    await db.run(
+      `INSERT INTO idea_usage_samples
+         (profile_id, uid, captured_at, idea_credit, desktop_credit, total_credit)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [profileId, accountUid, at, idea,
+        Math.round(Number(desktopCredit || 0) * 100) / 100,
+        Math.round(Number(totalCredit || 0) * 100) / 100]
+    );
+    // 采样只用于观察变化趋势，保留 7 天足够。
+    await db.run(
+      `DELETE FROM idea_usage_samples WHERE profile_id = ? AND uid = ? AND captured_at < ?`,
+      [profileId, accountUid, at - 7 * 86400000]
+    );
+    return true;
+  }
+
   async function listDailyUsageRange(uids, fromDate, toDate) {
     await initialize();
     const accountUids = Array.from(new Set((Array.isArray(uids) ? uids : []).map((uid) => validIdentity(uid, 'uid'))));
@@ -354,6 +577,13 @@ function createCreditUsageStore(options = {}) {
     if (reset !== null && (!Number.isSafeInteger(reset) || reset < 0)) throw new Error('限流解封时间无效');
     const reason = reasonCode === null || reasonCode === undefined ? null : Number(reasonCode);
     if (reason !== null && !Number.isSafeInteger(reason)) throw new Error('限流 code 无效');
+    // 同一模型可能由不同上报路径写成仅大小写不同的 model_id（如 Step-5-Preview / step-5-preview），
+    // 主键区分大小写会落成两条重复行。写入前先清掉同账号的大小写变体，保证一个模型只留一条。
+    await db.run(
+      `DELETE FROM model_rate_limit_records
+       WHERE profile_id = ? AND uid = ? AND model_id <> ? AND lower(model_id) = lower(?)`,
+      [profileId, accountUid, id, id]
+    );
     await db.run(
       `INSERT INTO model_rate_limit_records
          (profile_id, uid, model_id, model_name, reset_at, observed_at, source, reason_code)
@@ -380,7 +610,7 @@ function createCreditUsageStore(options = {}) {
     const rows = await db.all(
       `SELECT 1
        FROM model_rate_limit_records
-       WHERE profile_id = ? AND uid <> ? AND model_id = ? AND reset_at = ? AND reset_at > ?
+       WHERE profile_id = ? AND uid <> ? AND lower(model_id) = lower(?) AND reset_at = ? AND reset_at > ?
        LIMIT 1`,
       [profileId, accountUid, id, reset, timestamp]
     );
@@ -407,8 +637,13 @@ function createCreditUsageStore(options = {}) {
       [profileId, ...accountUids]
     );
     const result = {};
+    const seen = new Set();
     for (const row of rows) {
       if (!accountUids.includes(row.uid)) continue;
+      // 兼容历史大小写重复：同一账号同一模型只保留最近观察的一条（rows 已按 observed_at DESC 排序）。
+      const dedupKey = row.uid + '|' + String(row.model_id).toLowerCase();
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
       if (!result[row.uid]) result[row.uid] = [];
       result[row.uid].push({
         modelId: String(row.model_id), modelName: String(row.model_name || ''),
@@ -422,6 +657,12 @@ function createCreditUsageStore(options = {}) {
 
   return {
     dailyUsageForUid,
+    totalUsageForUids,
+    clientUsageForUids,
+    savePolledUsage,
+    saveIdeaRequests,
+    ideaUsageSummary,
+    recordIdeaSample,
     listDailyUsageRange,
     getDailyCheckin,
     listDailyCheckins,

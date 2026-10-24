@@ -28,7 +28,7 @@ function harness() {
     alive: true, CAPS: { accounts: true }, WBS_PROFILE_IS_AI: false, accountsPane: pane, panel: el(), fab: el(), fabQuietMode: { wake() {} },
     api(route, options) { return new Promise((resolve, reject) => requests.push({ route, options, resolve, reject })); },
     el, esc: String, escAttr: String, tokenState: () => ({ label: '-' }), isIdentityExpired: a => !!a.identityExpired,
-    checkinBadgeHtml: () => '', creditBlockHtml: () => '', applyAccountMask() {}, updateAccountSummary() {},
+    checkinBadgeHtml: () => '', creditBlockHtml: () => '', perCardUsageLineHtml: () => '', refreshPerCardUsage() {}, applyAccountMask() {}, updateAccountSummary() {},
     updateCheckinCells() {}, updateCreditCell() {}, fetchActivityForAccounts() {}, toast() {}, root: {},
     MODEL_EDIT_SVG: '', PRIMARY_ACCOUNT_SVG: '', SWITCH_SVG: '', TRASH_SVG: '',
     setBuildTimeout: fn => fn(), setTimeout: () => 1, clearTimeout() {},

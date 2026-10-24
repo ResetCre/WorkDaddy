@@ -138,9 +138,11 @@ const {
 const { createThirdPartyImport } = require('./third-party-models.js');
 const { extractCreditSegments, sortCreditSegments, mergeCreditSegments, parseEnterpriseUsage, ENTERPRISE_EDITIONS } = require('./credit-segments.js');
 const { buildCreditResourceBody } = require('./credit-resource-queries.js');
-const { fetchUsageSinceAnchor, startOfLocalDay } = require('./credit-request-usage.js');
+const { fetchUsageSinceAnchor, fetchUsageFullScan, startOfLocalDay } = require('./credit-request-usage.js');
 const { createCreditHistorySync, historyRange } = require('./credit-history-sync.js');
 const { createCreditUsageStore } = require('./credit-usage-store.js');
+// 官方累计用量（含 IDEA）聚合结果的内存缓存，配合本地文件 official-usage-total.json 持久化。
+let officialTotalCache = null;
 const { scanTokenStatsCached, tokenStatsCacheReady } = require('./token-stats.js');
 const { classifyCheckinResult, checkinEndpointsForToken } = require('./checkin-result.js');
 const {
@@ -8603,6 +8605,9 @@ async function restoreSavedTheme() {
     await startNativeAppearanceSyncByCdp();
     return;
   }
+  // saved 为 default 表示没有 WorkDaddy 自定义主题：不要回写官方外观，
+  // 否则会把用户在工作台里选的官方主题（如自定义配色）重置成浅色。
+  if (readSavedThemeId() === 'default') return;
   await applyThemeByCdp(readSavedThemeId(), { automatic: true });
 }
 
@@ -10037,6 +10042,209 @@ async function syncCurrentCreditUsage(uid, accessToken) {
   }
 }
 
+/* ---------- 官方明细逐日落库：IDEA 客户端拆分只能靠本地累加 ----------
+ * get-user-request-usage 只回最近 31 天，但每条带 client（WorkBuddy / JetBrainsIntelliJIdea）。
+ * 这里按账号定期全量扫描最近 31 天并 upsert（幂等），既补历史也补漏跑的时段，
+ * 使 /api/credit-usage/by-client 能给出超过 31 天的累计 IDEA 消耗。 */
+const CREDIT_USAGE_SWEEP_INTERVAL_MS = 6 * 3600 * 1000;
+const CREDIT_USAGE_BACKFILL_DAYS = 30;
+let creditUsageSweepPromise = null;
+
+async function sweepCreditUsageClients() {
+  if (creditUsageSweepPromise) return creditUsageSweepPromise;
+  creditUsageSweepPromise = (async () => {
+    const now = new Date();
+    const nowMs = now.getTime();
+    const startTime = startOfLocalDay(new Date(nowMs - CREDIT_USAGE_BACKFILL_DAYS * 86400000));
+    const summary = { synced: 0, records: 0, failures: [] };
+    for (const account of listAccounts(DATA_DIR)) {
+      const uid = String(account.uid || '').trim();
+      if (!uid) continue;
+      let token = '';
+      try {
+        const session = wdCompatDecryptAuthJson(JSON.parse(fs.readFileSync(accountBackupFile(uid), 'utf8'))); // [wd-compat]
+        token = wdCompatAuthToken(session.auth);
+      } catch (_) { /* 备份不可读：走下面的失败分支 */ }
+      if (!token) { summary.failures.push({ uid, error: '账号凭据不可用' }); continue; }
+      try {
+        const result = await fetchUsageFullScan({
+          accessToken: token,
+          apiHost: PROFILE.apiHost || 'https://www.workbuddy.cn',
+          startTime,
+          endTime: now,
+          pageSize: 3000,
+        });
+        await CREDIT_USAGE_STORE.saveHistoryUsage({
+          uid, records: result.records, from: todayStr(startTime), to: todayStr(now), syncedAt: nowMs,
+        });
+        summary.synced++;
+        summary.records += result.records.length;
+      } catch (error) {
+        const message = String(error && error.message || error).slice(0, 200);
+        summary.failures.push({ uid, error: message });
+        log(`[credit-sweep] 账号 ${uid} 明细同步失败: ${message}`);
+      }
+    }
+    log(`[credit-sweep] 完成: 成功 ${summary.synced} 个账号 / ${summary.records} 条，失败 ${summary.failures.length} 个`);
+    return summary;
+  })();
+  try { return await creditUsageSweepPromise; } finally { creditUsageSweepPromise = null; }
+}
+
+function scheduleCreditUsageSweep() {
+  const run = () => { sweepCreditUsageClients().catch((error) => log('[credit-sweep] ' + (error && error.message || error))); };
+  const first = setTimeout(run, 10 * 1000);
+  const timer = setInterval(run, CREDIT_USAGE_SWEEP_INTERVAL_MS);
+  if (first.unref) first.unref();
+  if (timer.unref) timer.unref();
+}
+
+/* ---------- IDEA 5 秒轮询：窄窗口增量 + 变化采样 ----------
+ * 本地插件目录没有任何消耗记录（只有会话元数据），唯一数据源是官方明细接口。
+ * 每 5 秒只取「上次轮询之后」的窄窗口，避免全量重扫；任何一次失败进入指数退避，
+ * 且同一时刻只允许一轮在跑，防止 429/6004 限流雪崩。 */
+const IDEA_POLL_INTERVAL_MS = 5000;
+const IDEA_POLL_OVERLAP_MS = 60 * 1000;
+const IDEA_POLL_MAX_LOOKBACK_MS = 15 * 60 * 1000;
+const IDEA_POLL_MAX_BACKOFF_MS = 5 * 60 * 1000;
+const ideaPollCursor = new Map();
+let ideaPollRunning = false;
+let ideaPollBackoffUntil = 0;
+let ideaPollBackoffMs = 0;
+
+function isIdeaClient(name) {
+  return /jetbrains|intellij/i.test(String(name || ''));
+}
+
+async function pollIdeaUsageOnce() {
+  if (ideaPollRunning) return;
+  const startedAt = Date.now();
+  if (startedAt < ideaPollBackoffUntil) return;
+  ideaPollRunning = true;
+  try {
+    const now = new Date(startedAt);
+    for (const account of listAccounts(DATA_DIR)) {
+      const uid = String(account.uid || '').trim();
+      if (!uid) continue;
+      let token = '';
+      try {
+        const session = wdCompatDecryptAuthJson(JSON.parse(fs.readFileSync(accountBackupFile(uid), 'utf8'))); // [wd-compat]
+        token = wdCompatAuthToken(session.auth);
+      } catch (_) { /* 备份不可读：跳过该账号 */ }
+      if (!token) continue;
+      const cursor = ideaPollCursor.get(uid) || 0;
+      const from = Math.max(cursor, startedAt - IDEA_POLL_MAX_LOOKBACK_MS);
+      const result = await fetchUsageFullScan({
+        accessToken: token,
+        apiHost: PROFILE.apiHost || 'https://www.workbuddy.cn',
+        startTime: new Date(from - IDEA_POLL_OVERLAP_MS),
+        endTime: now,
+        pageSize: 500,
+      });
+      if (result.records.length) await CREDIT_USAGE_STORE.savePolledUsage(uid, result.records);
+      ideaPollCursor.set(uid, startedAt);
+      const usage = await CREDIT_USAGE_STORE.clientUsageForUids([uid], todayStr(now));
+      const entry = usage[uid] || { total: 0, clients: {} };
+      let idea = 0;
+      let desktop = 0;
+      for (const [name, value] of Object.entries(entry.clients || {})) {
+        if (isIdeaClient(name)) idea += Number(value) || 0;
+        else desktop += Number(value) || 0;
+      }
+      await CREDIT_USAGE_STORE.recordIdeaSample({
+        uid, capturedAt: startedAt, ideaCredit: idea, desktopCredit: desktop,
+        totalCredit: Number(entry.total) || 0,
+      });
+    }
+    if (ideaPollBackoffMs) log('[idea-poll] 已恢复，退避重置');
+    ideaPollBackoffMs = 0;
+    ideaPollBackoffUntil = 0;
+  } catch (error) {
+    ideaPollBackoffMs = ideaPollBackoffMs ? Math.min(ideaPollBackoffMs * 2, IDEA_POLL_MAX_BACKOFF_MS) : 30000;
+    ideaPollBackoffUntil = Date.now() + ideaPollBackoffMs;
+    log(`[idea-poll] 本轮失败，退避 ${Math.round(ideaPollBackoffMs / 1000)}s: ${String(error && error.message || error).slice(0, 160)}`);
+  } finally {
+    ideaPollRunning = false;
+  }
+}
+
+function scheduleIdeaUsagePoll() {
+  const tick = () => { pollIdeaUsageOnce().catch(() => {}); };
+  const first = setTimeout(tick, 3000);
+  const timer = setInterval(tick, IDEA_POLL_INTERVAL_MS);
+  if (first.unref) first.unref();
+  if (timer.unref) timer.unref();
+}
+
+/* ---------- IDE 插件本地会话扫描 ----------
+ * 官方接口不给 token，但插件把每条请求的 usage（含 credit / token）写在
+ * %LOCALAPPDATA%/CodeBuddyExtension/Data/<uid>/JetBrains/<uid>/history/<workspace>/<conv>/index.json。
+ * 按文件 mtime 增量解析（未变文件跳过），所以 5 秒一次开销也很小。 */
+const IDEA_LOCAL_DATA_ROOT = process.env.LOCALAPPDATA
+  ? path.join(process.env.LOCALAPPDATA, 'CodeBuddyExtension', 'Data')
+  : '';
+const ideaLocalFileStamp = new Map();
+
+function collectIdeaIndexFiles(dir, depth, out) {
+  if (depth > 3) return out;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return out; }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) collectIdeaIndexFiles(full, depth + 1, out);
+    else if (entry.name === 'index.json') out.push(full);
+  }
+  return out;
+}
+
+async function syncLocalIdeaUsage() {
+  if (!IDEA_LOCAL_DATA_ROOT) return { records: 0 };
+  let records = 0;
+  for (const account of listAccounts(DATA_DIR)) {
+    const uid = String(account.uid || '').trim();
+    if (!uid) continue;
+    const historyDir = path.join(IDEA_LOCAL_DATA_ROOT, uid, 'JetBrains', uid, 'history');
+    if (!fs.existsSync(historyDir)) continue;
+    const rows = [];
+    for (const file of collectIdeaIndexFiles(historyDir, 0, [])) {
+      let stat;
+      try { stat = fs.statSync(file); } catch (_) { continue; }
+      if (ideaLocalFileStamp.get(file) === stat.mtimeMs) continue;
+      let payload;
+      try { payload = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { continue; }
+      for (const request of (Array.isArray(payload.requests) ? payload.requests : [])) {
+        const usage = request && request.usage;
+        const requestId = String(request && request.id || '').trim();
+        const startedAt = Number(request && request.startedAt) || 0;
+        if (!requestId || !startedAt || !usage || typeof usage !== 'object') continue;
+        rows.push({
+          requestId, startedAt, usageDate: todayStr(new Date(startedAt)),
+          inputTokens: Number(usage.inputTokens) || 0,
+          outputTokens: Number(usage.outputTokens) || 0,
+          totalTokens: Number(usage.totalTokens) || 0,
+          cacheTokens: Number(usage.cacheTokens) || 0,
+          credit: Number(usage.credit) || 0,
+        });
+      }
+      ideaLocalFileStamp.set(file, stat.mtimeMs);
+    }
+    if (rows.length) {
+      await CREDIT_USAGE_STORE.saveIdeaRequests(uid, rows);
+      records += rows.length;
+    }
+  }
+  if (records) log(`[idea-local] 本地会话用量同步 ${records} 条`);
+  return { records };
+}
+
+function scheduleLocalIdeaScan() {
+  const run = () => { syncLocalIdeaUsage().catch((error) => log('[idea-local] 扫描失败: ' + (error && error.message || error))); };
+  const first = setTimeout(run, 6000);
+  const timer = setInterval(run, 5000);
+  if (first.unref) first.unref();
+  if (timer.unref) timer.unref();
+}
+
 /* ================= 加密导出 / 导入 =================
  * v2 导出：用户在面板输入非空密码；随机 salt + AES-256-GCM，密码不落盘、不写日志。
  * v1 导入：兼容历史固定密码 workdaddy 的导出文件，空密码即走旧格式默认值。
@@ -10891,7 +11099,8 @@ function handleApi(req, res) {
       const accounts = listAccounts(DATA_DIR);
       if (current && !accounts.some(a => String(a.uid) === String(current.uid))) accounts.push(current);
       return json(res, 200, { ok: true, supported: true, ...readPersonaSettings(DATA_DIR),
-        currentUid: String(current && current.uid || ''), sources: listPersonaSources({ dataRoot: PROFILE.dataRoot, accounts }) });
+        currentUid: String(current && current.uid || ''),
+        sources: listPersonaSources({ dataRoot: PROFILE.dataRoot, accounts, allowPendingBootstrap: true }) });
     } catch (error) { return json(res, 400, { ok: false, error: error.message }); }
   }
 
@@ -11109,6 +11318,95 @@ function handleApi(req, res) {
       const status = /日期范围|开始日期/.test(String(e && e.message)) ? 400 : 500;
       return json(res, status, { ok: false, error: e.message || '读取会话统计失败' });
       });
+  }
+
+  // 本机积分「全部」消耗：汇总 credit_usage_records 中各账号累计消耗的积分。
+  // 思路同 workbuddy-switch 的本地统计——不依赖官方计费接口，直接对本机已记录用量求和。
+  if (req.method === 'GET' && p === '/api/credit-usage/total') {
+    try {
+      const accounts = listAccounts(DATA_DIR);
+      return CREDIT_USAGE_STORE.totalUsageForUids(accounts.map((a) => a.uid))
+        .then((totals) => json(res, 200, { ok: true, totals: totals || {} }))
+        .catch((error) => json(res, 500, { ok: false, error: error.message || '读取积分总消耗失败' }));
+    } catch (error) {
+      return json(res, 500, { ok: false, error: error.message || '读取积分总消耗失败' });
+    }
+  }
+
+  // 账号累计消耗（含 IDEA）：复用官方 get-user-resource 的「账号级累计已用量」TotalDosage。
+  // 该值是服务端按账号聚合的历史累计（含已过期资源包、含更早消耗），天然把 IDEA 插件的
+  // JetBrainsIntelliJIdea 与 WorkBuddy 桌面端合并计入——与 workbuddy-switch 的官方计费口径同源。
+  // 本地统计只覆盖桌面端且不完整，故此处取官方真值。结果按 10 分钟内存 + 本地文件缓存；?force=1 绕过。
+  if (req.method === 'GET' && p === '/api/credit-usage/official-total') {
+    return (async () => {
+      try {
+        const force = url.searchParams.get('force') === '1';
+        const now = Date.now();
+        const CACHE_TTL_MS = 10 * 60 * 1000;
+        const cacheFile = path.join(DATA_DIR, 'official-usage-total.json');
+        if (!officialTotalCache) {
+          try { officialTotalCache = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch (_) { officialTotalCache = null; }
+        }
+        if (!force && officialTotalCache && officialTotalCache.at && now - officialTotalCache.at < CACHE_TTL_MS
+            && officialTotalCache.perUid && Object.keys(officialTotalCache.perUid).length) {
+          return json(res, 200, {
+            ok: true,
+            totals: officialTotalCache.perUid,
+            collectedAt: officialTotalCache.at,
+            cached: true,
+          });
+        }
+        const accounts = listAccounts(DATA_DIR);
+        const perUid = {};
+        for (const account of accounts) {
+          const uid = String(account.uid || '').trim();
+          if (!uid) continue;
+          let token;
+          try {
+            const session = wdCompatDecryptAuthJson(JSON.parse(fs.readFileSync(accountBackupFile(uid), 'utf8')));
+            token = wdCompatAuthToken(session.auth);
+          } catch (_) { continue; }
+          if (!token) continue;
+          try {
+            // 复用守护进程已有的资源/额度查询（含 401 过期归类与字段归一化），取账号累计已用量 TotalDosage。
+            const resource = await fetchResource(token, buildCreditResourceBody(), 'all-resources');
+            perUid[uid] = Math.round((Number(resource.totalDosage) || 0) * 100) / 100;
+          } catch (err) {
+            log(`[official-usage] 账号 ${uid} 累计用量拉取失败: ${err.message}`);
+            // 单账号失败不影响其他账号；保留该账号已有缓存值（若有）。
+            if (officialTotalCache && officialTotalCache.perUid && officialTotalCache.perUid[uid] != null) {
+              perUid[uid] = officialTotalCache.perUid[uid];
+            }
+          }
+        }
+        officialTotalCache = { at: now, perUid };
+        try { fs.writeFileSync(cacheFile, JSON.stringify(officialTotalCache)); } catch (_) {}
+        return json(res, 200, { ok: true, totals: perUid, collectedAt: now, cached: false });
+      } catch (error) {
+        return json(res, 500, { ok: false, error: error.message || '读取官方累计用量失败' });
+      }
+    })();
+  }
+
+  // 本地按天累加的官方明细：返回每个账号按 client 拆分的消耗与统计起点。
+  // 官方明细接口只回最近 31 天，这个累计值靠定期扫描逐日累积，时间越长越完整。
+  if (req.method === 'GET' && p === '/api/credit-usage/by-client') {
+    return (async () => {
+      try {
+        const accounts = listAccounts(DATA_DIR);
+        const uids = accounts.map((a) => String(a.uid || '')).filter(Boolean);
+        const usage = await CREDIT_USAGE_STORE.clientUsageForUids(uids, todayStr());
+        // 官方接口没有 token，IDE 页签的 credit/token 都取本地插件会话汇总。
+        const local = await CREDIT_USAGE_STORE.ideaUsageSummary(uids, todayStr());
+        for (const [uid, summary] of Object.entries(local)) {
+          const entry = usage[uid] || (usage[uid] = { total: 0, clients: {}, todayClients: {}, today: 0 });
+          entry.local = summary;
+        }
+        return json(res, 200, { ok: true, accounts: usage });
+      } catch (error) {
+        return json(res, 500, { ok: false, error: error.message || '读取客户端用量失败' });
+      }
+    })();
   }
 
   if (req.method === 'GET' && p === '/api/credit-stats') {
@@ -13133,6 +13431,9 @@ function startServer() {
       ACTUAL_PORT = port;
       writeUiPortFile(port);
       log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
+      scheduleCreditUsageSweep();
+      scheduleIdeaUsagePoll();
+      scheduleLocalIdeaScan();
     });
   };
   tryListen(0);

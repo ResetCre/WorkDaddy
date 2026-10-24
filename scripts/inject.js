@@ -389,6 +389,38 @@ function classifyAutoContinueReply(snapshot) {
 
 var AUTO_CONTINUE_QUOTA_CODES = { 14012: true, 14014: true, 14018: true, 14019: true, 6004: true };
 
+// 对齐 Switch 的限流解封时间解析：官方文案形如
+// 「您的使用量已超出频率限制，将在 2026-09-17 17:59:27 UTC+8 重置」/
+// 「will reset at 2026-09-14 10:59:21 UTC+8,」。优先按「重置」类文案 marker 取其后
+// 紧跟的日期时间（而不是在整段错误里找第一个时间，后者容易抓到请求时间戳）。
+// 偏移读取 UTC±H[:MM]，缺失时按 WorkBuddy 官方封顶时间所在的上海时区 +08:00 处理。
+function parseModelRateLimitResetAt(text) {
+  if (typeof text !== 'string' || !text) return null;
+  var markers = ['将在 ', 'will reset at ', '重置', 'reset at ', 'reset'];
+  for (var mi = 0; mi < markers.length; mi++) {
+    var marker = markers[mi];
+    var idx = text.indexOf(marker);
+    if (idx < 0) continue;
+    var rest = text.slice(idx + marker.length);
+    var dt = /^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/.exec(rest);
+    if (!dt) continue;
+    var naive = dt[1].replace(' ', 'T');
+    var off = /UTC([+-])(\d{1,2})(?::?(\d{2}))?/i.exec(rest);
+    var offsetStr;
+    if (off) {
+      var sign = off[1] === '-' ? '-' : '+';
+      var hh = off[2].length === 1 ? '0' + off[2] : off[2];
+      var mm = off[3] || '00';
+      offsetStr = sign + hh + ':' + mm;
+    } else {
+      offsetStr = '+08:00';
+    }
+    var ms = Date.parse(naive + offsetStr);
+    if (Number.isFinite(ms)) return ms;
+  }
+  return null;
+}
+
 function normalizeAutoContinueError(error) {
   if (!error || typeof error !== 'object') return null;
   var terminal = error.terminal && typeof error.terminal === 'object' ? error.terminal : {};
@@ -419,18 +451,30 @@ function normalizeAutoContinueError(error) {
   var resetAt = null;
   var resetSource = details.resetAt || details.reset_at || terminal.resetAt || error.resetAt;
   if (resetSource === undefined || resetSource === null || resetSource === '') {
-    var resetMatch = /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\s*\(?UTC[+-]\d{1,2}\)?)?)/i.exec(resetTextSource);
-    if (resetMatch) resetSource = resetMatch[1];
+    // 优先按官方「重置」文案精确解析其后时刻（对齐 Switch），抓不到再回退通用时间正则。
+    var parsedFromText = parseModelRateLimitResetAt(resetTextSource);
+    if (parsedFromText !== null) resetSource = parsedFromText;
+    else {
+      var resetMatch = /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\s*\(?UTC[+-]\d{1,2}\)?)?)/i.exec(resetTextSource);
+      if (resetMatch) resetSource = resetMatch[1];
+    }
+  } else {
+    resetSource = String(resetSource);
   }
   if (resetSource !== undefined && resetSource !== null && resetSource !== '') {
-    var resetNumber = Number(resetSource);
-    if (Number.isFinite(resetNumber)) resetAt = resetNumber < 1e12 ? Math.round(resetNumber * 1000) : Math.round(resetNumber);
-    else {
-      var resetText = String(resetSource).trim();
-      resetText = resetText.replace(/\s*\(?UTC\+0?8(?:00)?\)?$/i, '+08:00').replace(' ', 'T');
-      // Official cap dates are Shanghai wall clock, even on non-China hosts.
-      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(resetText)) resetText += '+08:00';
-      var parsed = Date.parse(resetText);
+    if (typeof resetSource === 'number' || /^\d+$/.test(String(resetSource).trim())) {
+      var resetNumber = Number(resetSource);
+      if (Number.isFinite(resetNumber)) resetAt = resetNumber < 1e12 ? Math.round(resetNumber * 1000) : Math.round(resetNumber);
+    } else {
+      // 结构化字段或文案里已是日期串：统一走 marker 解析（自带偏移处理）。
+      var parsed = parseModelRateLimitResetAt(String(resetSource));
+      if (parsed === null) {
+        // 兼容旧式纯文本解析（无 marker 时）。
+        var resetText = String(resetSource).trim();
+        resetText = resetText.replace(/\s*\(?UTC\+0?8(?:00)?\)?$/i, '+08:00').replace(' ', 'T');
+        if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(resetText)) resetText += '+08:00';
+        parsed = Date.parse(resetText);
+      }
       if (Number.isFinite(parsed)) resetAt = parsed;
     }
   }
@@ -459,7 +503,7 @@ function createModelRateLimitObserver(options) {
       var state = controller.sessionStore.getState() || {};
       [state.error, state.warning].forEach(function (error) {
         var normalized = normalizeAutoContinueError(error);
-        if (!normalized || normalized.code !== 6004) return;
+        if (!normalized || !normalized.rateLimited) return;
         var modelId = normalized.requestModelId || String(state.model || state.modelId || '');
         if (!modelId) return;
         binding.latest = {
@@ -2946,15 +2990,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!visible) hideUsagePopover();
     }
     function updateConversationUsageScrollState() {
-      var scrollElement = conversationUsage.scrollElement;
-      if (!scrollElement || !conversationUsage.summary) {
-        setConversationUsageVisible(false);
-        return;
-      }
-      var maxScroll = scrollElement.scrollHeight - scrollElement.clientHeight;
-      var canScroll = maxScroll > 1;
-      var atBottom = canScroll && maxScroll - scrollElement.scrollTop <= 4;
-      setConversationUsageVisible(atBottom);
+      // 常驻显示：底栏固定在输入区上方，不再随「是否滚到底」隐藏。
+      // 内容末尾的 spacer 已在 positionConversationUsage 里预留高度，滚到底也不会遮住最后一条。
+      setConversationUsageVisible(!!conversationUsage.summary);
     }
     function scheduleConversationUsageScrollState() {
       if (conversationUsage.scrollFrame != null) return;
@@ -3012,54 +3050,35 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var contentRect = surface.content.getBoundingClientRect();
       if (!contentRect || contentRect.width <= 0) return;
       var documentRect = surface.conversation && surface.conversation.getBoundingClientRect ? surface.conversation.getBoundingClientRect() : null;
-      // 元素引用缓存（断连才重新 querySelector）
-      var geo = conversationUsage.geoEls;
-      if (!geo || !geo.inputArea || !document.contains(geo.inputArea) || (geo.bottomMask && !document.contains(geo.bottomMask)) || (geo.viewport && !document.contains(geo.viewport))) {
-        geo = {
-          inputArea: document.querySelector('.conversation-input-area,.conversation-input,.cr-input-box'),
-          viewport: surface.content.closest('.cr-message-list-viewport'),
-          bottomMask: document.querySelector('.cr-message-list__bottom-mask'),
-        };
-        conversationUsage.geoEls = geo;
-      }
-      var inputRect = geo.inputArea && geo.inputArea.getBoundingClientRect();
-      var viewportRect = geo.viewport && geo.viewport.getBoundingClientRect();
-      var maskRect = geo.bottomMask && geo.bottomMask.getBoundingClientRect();
-      var anchorRect = maskRect && maskRect.width > 0 && maskRect.height > 0 ? maskRect : inputRect;
-      var anchorBottom = anchorRect && anchorRect.bottom > 0 ? anchorRect.bottom : (viewportRect && viewportRect.bottom) || window.innerHeight;
       // 水平基准使用真实消息文档，避免跟随外层 message-list-content 的内缩留白。
       var alignmentRect = documentRect && documentRect.width > 0 ? documentRect : contentRect;
-      var left = alignmentRect.left;
-      var maxWidth = alignmentRect.width;
-      left = Math.max(8, left);
-      var write = {
-        left: Math.round(left),
-        maxWidth: Math.round(Math.min(maxWidth, window.innerWidth - left - 8)),
-        // 与底部保留少量间距，避免组件紧贴输入区/窗口边缘。
-        bottom: Math.round(Math.max(4, window.innerHeight - anchorBottom + 4)),
-      };
-      var last = conversationUsage.lastWrite;
-      // 几何未变化时跳过样式写入，避免每次都触发 style invalidation
-      if (last && last.left === write.left && last.maxWidth === write.maxWidth && last.bottom === write.bottom) {
-        if (conversationUsage.spacer && conversationUsage.spacer.parentNode) {
-          var sh = Math.ceil(summary.getBoundingClientRect().height || 34);
-          if (last.spacerH !== sh) {
-            conversationUsage.spacer.style.height = sh + 'px';
-            last.spacerH = sh;
-          }
-        }
+      if (summary.classList.contains('is-fixed')) {
+        // 老结构回退：仍按输入区上方定位（fixed 浮层）。
+        var inputArea = document.querySelector('.conversation-input-area,.conversation-input,.cr-input-box');
+        var inputRect = inputArea && inputArea.getBoundingClientRect();
+        var anchorBottom = inputRect && inputRect.bottom > 0 ? inputRect.bottom : window.innerHeight;
+        var fixedWrite = {
+          left: Math.max(8, Math.round(alignmentRect.left)),
+          maxWidth: Math.round(alignmentRect.width),
+          bottom: Math.round(Math.max(4, window.innerHeight - anchorBottom + 4)),
+        };
+        var lastFixed = conversationUsage.lastFixedWrite;
+        if (lastFixed && lastFixed.left === fixedWrite.left && lastFixed.maxWidth === fixedWrite.maxWidth && lastFixed.bottom === fixedWrite.bottom) return;
+        conversationUsage.lastFixedWrite = fixedWrite;
+        summary.style.left = fixedWrite.left + 'px';
+        summary.style.width = 'max-content';
+        summary.style.maxWidth = fixedWrite.maxWidth + 'px';
+        summary.style.bottom = fixedWrite.bottom + 'px';
         return;
       }
-      conversationUsage.lastWrite = write;
-      summary.style.left = write.left + 'px';
-      summary.style.width = 'max-content';
-      summary.style.maxWidth = write.maxWidth + 'px';
-      summary.style.bottom = write.bottom + 'px';
-      if (conversationUsage.spacer && conversationUsage.spacer.parentNode) {
-        var sh2 = Math.ceil(summary.getBoundingClientRect().height || 34);
-        conversationUsage.spacer.style.height = sh2 + 'px';
-        write.spacerH = sh2;
-      }
+      // 常驻模式：底栏已在布局流里，只需要把文字对齐到消息内容左边缘。
+      var host = summary.parentNode && summary.parentNode.getBoundingClientRect ? summary.parentNode.getBoundingClientRect() : null;
+      var paddingLeft = Math.max(8, Math.round(alignmentRect.left - (host ? host.left : 0)));
+      var last = conversationUsage.lastWrite;
+      if (last && last.paddingLeft === paddingLeft) return;
+      conversationUsage.lastWrite = { paddingLeft: paddingLeft };
+      summary.style.paddingLeft = paddingLeft + 'px';
+      summary.style.paddingRight = '8px';
     }
     function showUsagePopover(event) {
       var copyButton = conversationUsage.summary && conversationUsage.summary.querySelector('.wbs-session-usage-copy');
@@ -3168,7 +3187,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       } else {
         main.appendChild(el('span', 'wbs-session-usage-number', formatUsageTokens(state.tokens) + ' Token'));
         main.appendChild(el('span', 'wbs-session-usage-separator', '·'));
-        main.appendChild(el('span', 'wbs-session-usage-number', formatUsageCredit(state.credit, state.creditKnown) + ' 积分'));
+        main.appendChild(el('span', 'wbs-session-usage-number wbs-session-usage-credit', formatUsageCredit(state.credit, state.creditKnown) + ' 积分'));
         main.appendChild(el('span', 'wbs-session-usage-separator', '·'));
         var models = state.models || [];
         var modelLabel = models.length === 1 ? models[0].modelName + ' × ' + calls : models.length + ' 个模型';
@@ -3237,17 +3256,27 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         listen(popover, 'mouseenter', showUsagePopover);
         listen(popover, 'mouseleave', scheduleHideUsagePopover);
       }
-      if (!conversationUsage.spacer) {
-        var spacer = el('div', 'wbs-session-usage-spacer');
-        spacer.setAttribute('aria-hidden', 'true');
-        conversationUsage.spacer = spacer;
-      }
-      if (surface && surface.content && conversationUsage.spacer.parentNode !== surface.content) {
-        surface.content.appendChild(conversationUsage.spacer);
-      }
-      // fixed 元素必须挂在 body 下；消息网格祖先带 transform，会改变 fixed 的坐标系。
-      if (conversationUsage.summary.parentNode !== document.body && document.body) {
+      // 底栏改为常驻布局元素：插在消息列表与输入区之间，占真实高度，滚动时不会盖住回复内容。
+      var shell = surface && surface.content ? surface.content.closest('.conversation-shell__main') : null;
+      if (shell) {
+        conversationUsage.summary.classList.remove('is-fixed');
+        var inputArea = shell.querySelector('.conversation-input-area');
+        var parent = conversationUsage.summary.parentNode;
+        var placed = inputArea
+          ? parent === shell && conversationUsage.summary.nextSibling === inputArea
+          : parent === shell;
+        if (!placed) {
+          if (inputArea) shell.insertBefore(conversationUsage.summary, inputArea);
+          else shell.appendChild(conversationUsage.summary);
+        }
+      } else if (conversationUsage.summary.parentNode !== document.body && document.body) {
+        // 老结构找不到布局容器时回退成 fixed 挂 body。
+        conversationUsage.summary.classList.add('is-fixed');
         document.body.appendChild(conversationUsage.summary);
+      }
+      // 底栏已进入布局流，不再需要遮挡用的 spacer。
+      if (conversationUsage.spacer && conversationUsage.spacer.parentNode) {
+        conversationUsage.spacer.parentNode.removeChild(conversationUsage.spacer);
       }
     }
     // 变更签名：流式期间 store 频繁触发，只有消息数/末条状态变化才重算（800ms tick 与 subscribe 共用）
@@ -3255,7 +3284,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!Array.isArray(messages) || !messages.length) return '0';
       var last = messages[messages.length - 1] || {};
       var usage = last.usage || {};
+      // UI 消息的 usage 是驼峰且没有 totalTokens，只认 total_tokens 会让签名恒定，
+      // 流式过程中底栏就再也不刷新。这里把 outputTokens / credit 一起纳入。
       return messages.length + '|' + (last.id || '') + '|' + (last.complete ? 1 : 0) + '|' +
+        (usage.inputTokens != null ? usage.inputTokens : '') + '|' +
+        (usage.outputTokens != null ? usage.outputTokens : '') + '|' +
+        (usage.credit != null ? usage.credit : '') + '|' +
         (usage.total_tokens != null ? usage.total_tokens : (usage.totalTokens != null ? usage.totalTokens : ''));
     }
     function maybeRenderUsage(messages) {
@@ -3263,7 +3297,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var sig = usageSignature(messages);
       if (sig === conversationUsage.lastSig) return;
       conversationUsage.lastSig = sig;
-      renderConversationUsage(collectConversationUsage(messages));
+      var state = collectConversationUsage(messages);
+      renderConversationUsage(state);
     }
     function bindUsageController(controller) {
       if (conversationUsage.controller === controller) {
@@ -6707,6 +6742,21 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     applyAccountNoteHoverState();
     // 账号 pane 初始化：顶部 导出/导入 工具栏 + 列表容器 + 底部退出登录按钮（原 foot 的 logout 迁移到账号 tab）
+    // 来源切换（顶部汇总与卡片共用同一状态）：后续接入 CodeBuddy 只需在这里加一项。
+    var WBS_USAGE_SOURCES = [
+      { id: 'wb', label: 'WorkBuddy' },
+      { id: 'ide', label: 'IDE 插件' },
+      { id: 'total', label: '总计' },
+    ];
+    var wbsUsageSource = 'total';
+    function wbsUsageSourceButtonsHtml() {
+      return WBS_USAGE_SOURCES.map(function (item) {
+        var on = item.id === wbsUsageSource;
+        return '<button type="button" class="wbs-usage-src-btn' + (on ? ' is-active' : '') +
+          '" data-src="' + item.id + '" aria-pressed="' + (on ? 'true' : 'false') + '">' + item.label + '</button>';
+      }).join('');
+    }
+
     if (accountsPane) {
       accountsPane.innerHTML =
         '<div class="wbs-acct-toolbar">' +
@@ -6718,11 +6768,21 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<button class="wbs-acct-eye" type="button" data-act="credit-summary" title="汇总" aria-label="积分汇总" aria-expanded="false">' + CREDIT_SUMMARY_ICON + '</button>' +
         '<button class="wbs-acct-eye" type="button" data-act="model-rate-limit-summary" title="模型限流" aria-label="模型限流" aria-expanded="false">' + MODEL_RATE_LIMIT_ICON + '</button>' +
         '</div>' +
+        '<div class="wbs-acct-toolbar-row">' +
+        '<div class="wbs-acct-stat wbs-acct-consumed-stat"><span>总消耗</span>' +
+        '<span class="wbs-usage-src wbs-usage-src-inline">' + wbsUsageSourceButtonsHtml() + '</span>' +
+        '<strong id="wbs-acct-consumed" class="wbs-consumed-wrap">' +
+        '<span class="wbs-consumed-item"><i>积分</i><b class="wbs-consumed-ci" data-val="pending">-</b></span>' +
+        '<span class="wbs-consumed-sep">·</span>' +
+        '<span class="wbs-consumed-item"><i class="wbs-consumed-tk-lbl">Token</i><b class="wbs-consumed-tk" data-val="pending">-</b></span>' +
+        '</strong></div>' +
         '<div class="wbs-acct-actions">' +
+        '<button class="wbs-acct-io wbs-acct-icon" type="button" data-act="refresh" title="刷新账号与用量数据" aria-label="刷新">' + USAGE_REFRESH_ICON + '</button>' +
         '<button class="wbs-acct-io wbs-acct-icon" type="button" data-act="token-stats" title="用量统计" aria-label="用量统计">' + TOKEN_STATS_ICON + '</button>' +
         '<button class="wbs-acct-io wbs-acct-icon" type="button" data-act="export" title="选择账号并输入密码后导出备份" aria-label="导出账号">' + EXPORT_ICON + '</button>' +
         '<button class="wbs-acct-io wbs-acct-icon" type="button" data-act="import" title="从加密导出文件导入账号备份" aria-label="导入账号">' + IMPORT_ICON + '</button>' +
         '<button class="wbs-acct-io wbs-acct-icon" type="button" data-act="account-more" title="账号设置" aria-label="账号设置"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.75a2 2 0 0 1 2 1.4l.4 1.1 1.15.47 1.06-.48a2 2 0 0 1 2.4.45l.8.8a2 2 0 0 1 .45 2.4l-.48 1.06.47 1.15 1.1.4a2 2 0 0 1 0 3.8l-1.1.4-.47 1.15.48 1.06a2 2 0 0 1-.45 2.4l-.8.8a2 2 0 0 1-2.4.45l-1.06-.48-1.15.47-.4 1.1a2 2 0 0 1-3.8 0l-.4-1.1-1.15-.47-1.06.48a2 2 0 0 1-2.4-.45l-.8-.8a2 2 0 0 1-.45-2.4l.48-1.06-.47-1.15-1.1-.4a2 2 0 0 1 0-3.8l1.1-.4.47-1.15-.48-1.06a2 2 0 0 1 .45-2.4l.8-.8a2 2 0 0 1 2.4-.45l1.06.48 1.15-.47.4-1.1A2 2 0 0 1 12 2.75Z"/><circle cx="12" cy="12.5" r="3"/></svg></button>' +
+        '</div>' +
         '</div>' +
         '</div>' +
         '<div class="wbs-persona-notice" hidden><span class="wbs-persona-notice-label"><span>同步个性化</span><button type="button" class="wbs-acct-eye wbs-persona-help" aria-label="了解同步个性化" aria-expanded="false">' + MODEL_TIP_SVG + '</button></span><span class="wbs-persona-notice-actions"><button type="button" class="wbs-modal-btn" data-act="persona-settings">设置</button><button type="button" class="wbs-persona-dismiss" data-act="persona-dismiss">不再提醒</button></span></div>' +
@@ -6743,6 +6803,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         openAccountImportChoice();
       });
       root.querySelector('#wbs-import-file').addEventListener('change', onImportFile);
+      var refreshBtn = root.querySelector('[data-act="refresh"]');
+      if (refreshBtn) refreshBtn.addEventListener('click', function () {
+        // 手动刷新：绕过 60s 用量缓存，强制重拉积分/token 消耗。
+        wbsUsageCache.ts = 0;
+        refreshBtn.classList.add('wbs-spin');
+        var p = refresh();
+        Promise.resolve(p).finally(function () { setTimeout(function () { refreshBtn.classList.remove('wbs-spin'); }, 400); });
+      });
     }
 
     if (accountsPane && CAPS.accounts) {
@@ -6796,15 +6864,23 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var save = mask.querySelector('[data-order-save]');
       save.disabled = true;
       function sync() {
-        needsSource = !!info && mode === 'shared' && (info.mode !== 'shared' || info.activeUid !== info.currentUid);
-        section.querySelector('[data-persona-source]').hidden = !needsSource;
+        var hasSource = !!info && info.sources.some(function (source) { return source.available; });
+        var activeSource = info && info.mode === 'shared' && info.activeUid === info.currentUid ? info.activeUid : '';
+        // 共享模式下始终展示且可改选来源：选中不同账号后保存，会用该账号的设置覆盖当前账号。
+        needsSource = !!info && mode === 'shared' &&
+          (info.mode !== 'shared' || info.activeUid !== info.currentUid ||
+            (!!select.value && select.value !== activeSource));
+        section.querySelector('[data-persona-source]').hidden = mode !== 'shared';
+        select.disabled = mode !== 'shared' || !hasSource;
         section.querySelector('[data-persona-description]').textContent = mode === 'shared'
           ? '所有账号使用同一份个性化设置。'
           : '每个账号使用各自的个性化设置，已同步的内容会保留。';
         var sourceHint = section.querySelector('[data-persona-source-hint]');
-        sourceHint.textContent = info && !info.sources.some(function (source) { return source.available; })
-          ? '请先在任一账号设置个性化。'
-          : select.value === 'legacy' ? '这是升级前所有账号共用的设置。' : '';
+        sourceHint.textContent = !hasSource ? '请先在任一账号设置个性化。'
+          : select.value === 'legacy' ? '这是升级前所有账号共用的设置。'
+          : mode === 'shared' && needsSource ? '保存后会以所选账号的设置覆盖当前账号。'
+          : mode === 'shared' ? '当前以该账号的设置为基准，切换账号时自动同步。'
+          : '';
         sourceHint.hidden = !sourceHint.textContent;
         applyI18n(section);
       }
@@ -7538,6 +7614,51 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       registerDisposer(function () { hide(true); closeDailyProgressPopover = null; refreshDailyProgressPopover = null; });
     }
 
+    // 限流记录落库后实时合并到本地账号状态，并精准局部更新限流徽章（不整卡重绘，
+    // 以免破坏已打开的限流弹窗引用）。对齐 Switch 的「记账即秒级推送前端」语义。
+    function refreshModelRateLimitsLive() {
+      try {
+        api('/api/accounts').then(function (data) {
+          try {
+            if (!data || !Array.isArray(data.accounts)) return;
+            var byUid = {};
+            data.accounts.forEach(function (a) { byUid[String(a.uid)] = a; });
+            state.accounts.forEach(function (account) {
+              var fresh = byUid[String(account.uid)];
+              if (fresh) account.modelRateLimits = fresh.modelRateLimits || [];
+            });
+            updateModelRateLimitBadges();
+            window.dispatchEvent(new Event('workduddy:model-rate-limit-updated'));
+          } catch (_) {}
+        }).catch(function () {});
+      } catch (_) {}
+    }
+
+    // 局部刷新每张账号卡片里的限流徽章（.wbs-name-group 内的 .wbs-model-rate-limit-slot）。
+    function updateModelRateLimitBadges() {
+      if (!accountsPane) return;
+      accountsPane.querySelectorAll('.wbs-card').forEach(function (card) {
+        var uid = card.getAttribute('data-uid');
+        if (!uid) return;
+        var account = null;
+        for (var i = 0; i < state.accounts.length; i++) {
+          if (String(state.accounts[i].uid) === String(uid)) { account = state.accounts[i]; break; }
+        }
+        if (!account) return;
+        var nameGroup = card.querySelector('.wbs-name-group');
+        if (!nameGroup) return;
+        var existing = nameGroup.querySelector('.wbs-model-rate-limit-slot');
+        var html = modelRateLimitBadgeHtml(account);
+        if (existing) {
+          if (html) existing.outerHTML = html; else existing.remove();
+        } else if (html) {
+          var checkin = nameGroup.querySelector('.wbs-checkin-slot');
+          if (checkin) checkin.insertAdjacentHTML('afterend', html);
+          else nameGroup.insertAdjacentHTML('beforeend', html);
+        }
+      });
+    }
+
     function setupModelRateLimitPopover() {
       if (!accountsPane) return;
       var popup = ensureStatusPopover();
@@ -7653,6 +7774,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       listen(window, 'resize', function () { hide(true); });
       listen(accountsPane, 'scroll', function () { hide(true); }, true);
       listen(document, 'keydown', function (event) { if (event.key === 'Escape') hide(true); });
+      // 限流记录落库后实时重绘已打开的限流窗口（对齐 Switch 的 rate-limits-updated 推送）。
+      listen(window, 'workdaddy:model-rate-limit-updated', function () {
+        if (!activeBadge) return;
+        if (activeBadge === summaryButton) showSummary(pinned);
+        else show(activeBadge, pinned);
+      });
       registerDisposer(function () { hide(true); });
     }
 
@@ -11961,8 +12088,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 面板高度固定为主题页高度：防止切 tab 时高度忽高忽低（首次主题页壁纸渲染后锁定一次）
     function lockPanelHeight() {
       if (!panel || panel.dataset.hLocked) return;
-      panel.style.height = '650px';
-      panel.style.maxHeight = '650px';
+      // 高度取「目标 820px」与「视口高度 − 48px」的较小值，小屏不溢出、大屏更宽松。
+      var lockedHeight = Math.max(520, Math.min(820, (window.innerHeight || 900) - 48));
+      panel.style.height = lockedHeight + 'px';
+      panel.style.maxHeight = lockedHeight + 'px';
       panel.dataset.hLocked = '1';
       var bodyEl = panel.querySelector('.wbs-body');
       if (bodyEl) bodyEl.style.overflowY = 'auto';
@@ -13823,7 +13952,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function acRecordModelRateLimit(snapshot) {
-      if (!snapshot || !snapshot.rateLimited || Number(snapshot.errorCode) !== 6004) return;
+      if (!snapshot || !snapshot.rateLimited) return;
       var modelId = String(snapshot.errorRequestModelId || 'unknown-model').slice(0, 160);
       var code = Number(snapshot.errorCode);
       var signature = [snapshot.conversationId, snapshot.assistantId, modelId, code, snapshot.errorResetAt || ''].join('|');
@@ -13848,9 +13977,56 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           }),
         }).then(function () {
           acRateLimitRecorded[signature] = true;
-          try { window.dispatchEvent(new Event('workdaddy:accounts-updated')); } catch (_) {}
+          try { refreshModelRateLimitsLive(); } catch (_) {}
         });
       }).catch(function () { delete acRateLimitRecorded[signature]; });
+    }
+
+    // 官方限流 banner 检测：WorkBuddy 以独立 banner（而非会话 error/warning）展示模型频率限制，
+    // 而原有模型限流检测只读取 controller.sessionStore 的 error/warning，导致 banner 型限流永远
+    // 检测不到（daemon 日志中也查无痕迹）。这里直接扫描 DOM 中的官方限流文案，解析模型名与解封时间，
+    // 复用现有 acRecordModelRateLimit 记录链路落库（reasonCode 6004，daemon 已接受）并触发实时刷新。
+    function setupOfficialRateLimitBannerWatch() {
+      var seen = Object.create(null);
+      function scan() {
+        try {
+          if (!document || !document.body) return;
+          var text = document.body.textContent || '';
+          // 仅匹配官方限流文案，区别于 WorkDaddy 自身「模型限流」界面文案
+          if (text.indexOf('使用量已超出频率限制') < 0 || text.indexOf('重置后使用') < 0) return;
+          var modelMatch = /您在\s*([\s\S]{1,80}?)\s*模型的使用量/.exec(text);
+          var timeMatch = /可在[^0-9]*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/.exec(text);
+          if (!modelMatch || !timeMatch) return;
+          var modelName = modelMatch[1].trim();
+          var resetAt = Date.parse(timeMatch[1].replace(' ', 'T'));
+          if (!modelName || !Number.isFinite(resetAt)) return;
+          var key = modelName + '|' + resetAt;
+          if (seen[key]) return;
+          seen[key] = true;
+          // 复用现有记录链路：解析 uid、POST（reasonCode 6004）、并触发 refreshModelRateLimitsLive 实时刷新
+          acRecordModelRateLimit({
+            conversationId: (typeof acActiveConversationId === 'function' ? acActiveConversationId() : null) || 'banner-rate-limit',
+            assistantId: '',
+            rateLimited: true,
+            errorCode: 6004,
+            errorRequestModelId: modelName,
+            errorModelName: modelName,
+            errorResetAt: resetAt,
+          });
+        } catch (_) {}
+      }
+      scan();
+      if (typeof MutationObserver === 'undefined' || !document.body) return function () {};
+      var pending = null;
+      var observer = new MutationObserver(function () {
+        if (pending) return;
+        pending = setTimeout(function () { pending = null; scan(); }, 600);
+      });
+      try { observer.observe(document.body, { childList: true, subtree: true, characterData: true }); } catch (_) {}
+      return function () {
+        try { observer.disconnect(); } catch (_) {}
+        if (pending) { clearTimeout(pending); pending = null; }
+      };
     }
 
     function acControllerSnapshot(controller) {
@@ -15851,11 +16027,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function todayUsageHtml(a) {
-      var usage = a && a.todayUsage;
-      if (!usage || usage.synced !== true) return '';
-      var used = Number(usage.used);
-      if (!isFinite(used) || used <= 0) return '';
-      return '<span class="wbs-usage-tag"><span>今日已使用</span>' + CREDIT_ICON + '<b>' + fmtCredits(used) + '</b></span>';
+      // 卡片右上角「今日已使用」标签已移除（今日/全部用量改由卡片内两行明细展示）。
+      return '';
     }
 
     function accountStatusTagsHtml(a) {
@@ -15946,6 +16119,292 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<div class="wbs-credit-line"><div class="wbs-credit-left"><span class="wbs-lbl">剩余</span><span class="wbs-credit-total">' + CREDIT_ICON + '<b>' + fmtCredits(credits) + '</b></span></div>' + usage + '</div>' +
         creditBarHtml(credits, segments) +
         '</div>';
+    }
+
+    // 账号卡片底部「消耗」区：顶部一行来源切换（与顶部汇总共用 wbsUsageSource），
+    // 下面两行的数字随选中来源变化。
+    function perCardUsageLineHtml(account) {
+      var usedCredits = account && account.todayUsage ? Number(account.todayUsage.used) : NaN;
+      if (!isFinite(usedCredits) || usedCredits <= 0) usedCredits = 0;
+      var srcHtml = wbsUsageSourceButtonsHtml();
+      return '<div class="wbs-usage-line" data-uid="' + escAttr(account && account.uid || '') + '" data-nickname="' + escAttr(account && account.nickname || '') + '">' +
+        '<div class="wbs-usage-src">' + srcHtml + '</div>' +
+        '<div class="wbs-usage-row"><span class="wbs-usage-lbl">积分消耗</span>' +
+          '<span class="wbs-usage-val wbs-ci-today">' + fmtCredits(usedCredits) + '</span><span class="wbs-usage-tag">(今日)</span>' +
+          '<span class="wbs-usage-val wbs-ci-all" data-val="pending">—</span><span class="wbs-usage-tag">(全部)</span></div>' +
+        '<div class="wbs-usage-row"><span class="wbs-usage-lbl">token消耗</span>' +
+          '<span class="wbs-usage-val wbs-tk-today" data-val="pending">—</span><span class="wbs-usage-tag">(今日)</span>' +
+          '<span class="wbs-usage-val wbs-tk-all" data-val="pending">—</span><span class="wbs-usage-tag">(全部)</span></div>' +
+        '</div>';
+    }
+
+    var wbsUsageCache = { ts: 0, creditAll: null, tokenAll: null, tokenToday: null, ideas: null, clientFrom: '' };
+    var WBS_USAGE_TTL = 60000;
+    function wbsTodayStr() {
+      var d = new Date(), p = function (n) { return String(n).padStart(2, '0'); };
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+    }
+    function wbsMatch(map, uid, name) {
+      if (uid && map && map.byUid && map.byUid[uid] != null) return map.byUid[uid];
+      if (name && map && map.byName && map.byName[name] != null) return map.byName[name];
+      return null;
+    }
+    function wbsAccountByUid(uid) {
+      var list = (state && state.accounts) || [];
+      for (var i = 0; i < list.length; i++) {
+        if (String(list[i] && list[i].uid) === String(uid)) return list[i];
+      }
+      return null;
+    }
+
+    // 消耗区的 token 展示：0 也输出 0.00，与积分行的 0.00 保持一致
+    // （formatTokenCount 还被"调用次数/饼图"复用，那边 0 应该保持 0，故不直接改它）。
+    function formatUsageTokens(value) {
+      var num = Number(value) || 0;
+      return num > 0 ? formatTokenCount(num) : '0.00';
+    }
+
+    function applyUsageValue(el, value, formatter) {
+      if (!el) return;
+      // 无记录（todayUsage 缺失、本地无会话等）按 0 展示，不显示占位破折号。
+      var num = Number(value);
+      if (!isFinite(num) || num < 0) num = 0;
+      el.textContent = formatter(num);
+      el.setAttribute('data-val', 'ok');
+    }
+
+    function syncUsageSourceButtons(root) {
+      if (!root) return;
+      root.querySelectorAll('.wbs-usage-src-btn').forEach(function (btn) {
+        var on = btn.getAttribute('data-src') === wbsUsageSource;
+        btn.classList.toggle('is-active', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+    }
+
+    function applyUsageMaps(list) {
+      if (!list) return;
+      list.querySelectorAll('.wbs-usage-line').forEach(function (line) {
+        var uid = line.getAttribute('data-uid');
+        var name = line.getAttribute('data-nickname');
+
+        syncUsageSourceButtons(line);
+
+        var acc = wbsAccountByUid(uid);
+        var totalToday = acc && acc.todayUsage ? Number(acc.todayUsage.used) : NaN;
+        if (!isFinite(totalToday) || totalToday < 0) totalToday = NaN;
+        var totalAll = wbsMatch(wbsUsageCache.creditAll, uid, name);        // 官方累计（含 IDE）
+        var ideas = wbsUsageCache.ideas || {};
+        var ideaAll = wbsMatch(ideas, uid, name);                           // IDE 插件本地累计
+        var ideaTodayRaw = (ideas.todayByUid || {})[uid];
+        var ideaToday = isFinite(Number(ideaTodayRaw)) ? Number(ideaTodayRaw) : 0;
+        var ideaAllNum = ideaAll == null ? 0 : Number(ideaAll) || 0;
+        var ideaTokens = Number((ideas.tokensByUid || {})[uid]) || 0;
+        var ideaTokensToday = Number((ideas.tokensTodayByUid || {})[uid]) || 0;
+        var desktopToday = wbsMatch(wbsUsageCache.tokenToday, uid, name);
+        var desktopAll = wbsMatch(wbsUsageCache.tokenAll, uid, name);
+
+        var ciToday = null, ciAll = null, tkToday = null, tkAll = null;
+        var ciAllTitle = '';
+        var tkTitle = '';
+
+        if (wbsUsageSource === 'ide') {
+          ciToday = ideaTodayRaw == null ? null : ideaToday;
+          ciAll = ideaAll;
+          ciAllTitle = 'IDE 插件本地会话（含缓存 token），起点 ' + (wbsUsageCache.clientFrom || '未知');
+          tkToday = ideaTokensToday || (ideaAllNum > 0 ? 0 : null);
+          tkAll = ideaTokens || (ideaAllNum > 0 ? 0 : null);
+          tkTitle = 'IDE 插件本地会话 token（含缓存）';
+        } else if (wbsUsageSource === 'wb') {
+          ciToday = isFinite(totalToday) ? Math.max(0, totalToday - ideaToday) : null;
+          ciAll = totalAll == null ? null : Math.max(0, Number(totalAll) - ideaAllNum);
+          ciAllTitle = '总计（官方累计）扣除已采集的 IDE 插件累计';
+          tkToday = desktopToday;
+          tkAll = desktopAll;
+          tkTitle = 'WorkBuddy 桌面端 token';
+        } else {
+          ciToday = isFinite(totalToday) ? totalToday : null;
+          ciAll = totalAll;
+          ciAllTitle = '官方累计已用（含 IDE 插件）';
+          tkToday = desktopToday == null ? (ideaTokensToday || null) : desktopToday + ideaTokensToday;
+          tkAll = desktopAll == null ? (ideaTokens || null) : desktopAll + ideaTokens;
+          tkTitle = '桌面端 + IDE 插件（IDE 含缓存 token）';
+        }
+
+        var ciTodayEl = line.querySelector('.wbs-ci-today');
+        var ciAllEl = line.querySelector('.wbs-ci-all');
+        var tkTodayEl = line.querySelector('.wbs-tk-today');
+        var tkAllEl = line.querySelector('.wbs-tk-all');
+        applyUsageValue(ciTodayEl, ciToday, fmtCredits);
+        applyUsageValue(ciAllEl, ciAll, fmtCredits);
+        applyUsageValue(tkTodayEl, tkToday, formatUsageTokens);
+        applyUsageValue(tkAllEl, tkAll, formatUsageTokens);
+        if (ciAllEl) ciAllEl.title = ciAllTitle;
+        if (tkTodayEl) tkTodayEl.title = tkTitle;
+        if (tkAllEl) tkAllEl.title = tkTitle;
+      });
+    }
+
+    if (accountsPane) {
+      listen(accountsPane, 'click', function (event) {
+        var target = event.target;
+        var btn = target && target.closest ? target.closest('.wbs-usage-src-btn') : null;
+        if (!btn || !accountsPane.contains(btn)) return;
+        var src = btn.getAttribute('data-src');
+        if (!src || src === wbsUsageSource) return;
+        wbsUsageSource = src;
+        applyUsageMaps(accountsPane);
+        applyTopConsumed();
+      });
+    }
+    function refreshPerCardUsage(list) {
+      if (!list) return;
+      var now = Date.now();
+      if (wbsUsageCache.ts && (now - wbsUsageCache.ts) < WBS_USAGE_TTL) {
+        applyUsageMaps(list);
+        return;
+      }
+      var creditP = api('/api/credit-usage/official-total').then(function (r) {
+        var totals = (r && r.totals) || {};
+        var byUid = Object.create(null);
+        Object.keys(totals).forEach(function (uid) { byUid[uid] = Number(totals[uid]) || 0; });
+        return { byUid: byUid, byName: Object.create(null) };
+      }).catch(function () { return { byUid: Object.create(null), byName: Object.create(null) }; });
+      var tokenP = api('/api/token-stats?days=90').then(function (result) {
+        var stats = result && result.stats || {};
+        var allByUid = Object.create(null), allByName = Object.create(null);
+        var todayByUid = Object.create(null), todayByName = Object.create(null);
+        var tday = wbsTodayStr();
+        (stats.accounts || []).forEach(function (item) {
+          var uid = item.account, nm = item.nickname;
+          var total = item.total == null ? (item.input || 0) + (item.output || 0) + (item.cacheWrite || 0) : item.total;
+          total = Number(total) || 0;
+          if (uid) allByUid[uid] = total;
+          if (nm) allByName[nm] = total;
+        });
+        (stats.dailyBreakdown || []).forEach(function (row) {
+          if (row.day !== tday) return;
+          var uid = row.account, nm = row.nickname || '';
+          var t = Number(row.total) || 0;
+          if (uid) todayByUid[uid] = (todayByUid[uid] || 0) + t;
+          if (nm) todayByName[nm] = (todayByName[nm] || 0) + t;
+        });
+        return { allByUid: allByUid, allByName: allByName, todayByUid: todayByUid, todayByName: todayByName };
+      }).catch(function () { return { allByUid: Object.create(null), allByName: Object.create(null), todayByUid: Object.create(null), todayByName: Object.create(null) }; });
+      var clientP = api('/api/credit-usage/by-client').then(function (result) {
+        var accounts = (result && result.accounts) || {};
+        var byUid = Object.create(null);
+        var todayByUid = Object.create(null);
+        var tokensByUid = Object.create(null);
+        var tokensTodayByUid = Object.create(null);
+        var sampleAt = Object.create(null);
+        var from = '';
+        Object.keys(accounts).forEach(function (uid) {
+          var entry = accounts[uid] || {};
+          var local = entry.local || null;
+          if (local) {
+            // 本地插件会话最准：credit 与 token 同源，且不受官方 31 天窗口限制。
+            byUid[uid] = Math.round((Number(local.totalCredit) || 0) * 100) / 100;
+            todayByUid[uid] = Math.round((Number(local.todayCredit) || 0) * 100) / 100;
+            tokensByUid[uid] = Number(local.totalTokens) || 0;
+            tokensTodayByUid[uid] = Number(local.todayTokens) || 0;
+            if (local.from && (!from || local.from < from)) from = local.from;
+          } else {
+            // 无本地会话时回退到官方明细的 client 拆分（有 credit、无 token）。
+            var clients = entry.clients || {};
+            var todayClients = entry.todayClients || {};
+            var idea = 0, ideaToday = 0;
+            Object.keys(clients).forEach(function (name) {
+              if (/jetbrains|intellij/i.test(name)) idea += Number(clients[name]) || 0;
+            });
+            Object.keys(todayClients).forEach(function (name) {
+              if (/jetbrains|intellij/i.test(name)) ideaToday += Number(todayClients[name]) || 0;
+            });
+            byUid[uid] = Math.round(idea * 100) / 100;
+            todayByUid[uid] = Math.round(ideaToday * 100) / 100;
+            if (entry.from && (!from || entry.from < from)) from = entry.from;
+          }
+          if (entry.lastSampleAt) sampleAt[uid] = Number(entry.lastSampleAt) || 0;
+        });
+        return {
+          byUid: byUid, byName: Object.create(null),
+          todayByUid: todayByUid,
+          tokensByUid: tokensByUid, tokensTodayByUid: tokensTodayByUid,
+          sampleAt: sampleAt, from: from,
+        };
+      }).catch(function () {
+        return {
+          byUid: Object.create(null), byName: Object.create(null), todayByUid: Object.create(null),
+          tokensByUid: Object.create(null), tokensTodayByUid: Object.create(null),
+          sampleAt: Object.create(null), from: '',
+        };
+      });
+      Promise.all([creditP, tokenP, clientP]).then(function (results) {
+        wbsUsageCache.ts = Date.now();
+        wbsUsageCache.creditAll = results[0];
+        wbsUsageCache.tokenAll = { byUid: results[1].allByUid, byName: results[1].allByName };
+        wbsUsageCache.tokenToday = { byUid: results[1].todayByUid, byName: results[1].todayByName };
+        wbsUsageCache.ideas = results[2];
+        wbsUsageCache.clientFrom = results[2].from || '';
+        applyUsageMaps(list);
+        applyTopConsumed(results[0], results[1]);
+      });
+    }
+
+    // 顶部统计栏「总消耗」：与卡片共用同一个来源切换（WorkBuddy / IDE 插件 / 总计）。
+    //   总计 = 官方累计 TotalDosage；token = 桌面端 + IDE 插件
+    //   WorkBuddy = 总计 − IDE；token = 桌面端
+    //   IDE 插件 = 本地插件会话；token = 本地插件 token
+    function applyTopConsumed(creditAll, tokenStats) {
+      var el = document.getElementById('wbs-acct-consumed');
+      if (!el) return;
+      syncUsageSourceButtons(el.parentNode);
+      var ci = el.querySelector('.wbs-consumed-ci');
+      var tk = el.querySelector('.wbs-consumed-tk');
+      var ideas = wbsUsageCache.ideas || {};
+      var totalCredit = 0;
+      var byUid = (creditAll || wbsUsageCache.creditAll || {}).byUid || {};
+      Object.keys(byUid).forEach(function (k) { totalCredit += Number(byUid[k]) || 0; });
+      var desktopToken = 0;
+      // results[1] 的形状是 allByUid/byName；缓存里是 byUid/byName，两种都要兼容。
+      var tokenSource = tokenStats || wbsUsageCache.tokenAll || {};
+      var tByUid = tokenSource.allByUid || tokenSource.byUid || {};
+      Object.keys(tByUid).forEach(function (k) { desktopToken += Number(tByUid[k]) || 0; });
+      var ideaCredit = 0;
+      Object.keys(ideas.byUid || {}).forEach(function (k) { ideaCredit += Number(ideas.byUid[k]) || 0; });
+      var ideaToken = 0;
+      Object.keys(ideas.tokensByUid || {}).forEach(function (k) { ideaToken += Number(ideas.tokensByUid[k]) || 0; });
+
+      var credit = totalCredit;
+      var token = desktopToken;
+      if (wbsUsageSource === 'ide') {
+        credit = ideaCredit;
+        token = ideaToken;
+      } else if (wbsUsageSource === 'wb') {
+        credit = Math.max(0, totalCredit - ideaCredit);
+        token = desktopToken;
+      } else {
+        token = desktopToken + ideaToken;
+      }
+
+      if (ci) {
+        if (credit > 0) { ci.textContent = fmtCredits(credit); ci.setAttribute('data-val', 'ok'); }
+        else { ci.textContent = fmtCredits(0); ci.setAttribute('data-val', 'na'); }
+        ci.title = wbsUsageSource === 'ide'
+          ? ('IDE 插件本地会话，起点 ' + (wbsUsageCache.clientFrom || '未知'))
+          : wbsUsageSource === 'wb' ? '总计（官方累计）扣除已采集的 IDE 插件累计'
+          : '官方累计已用（含 IDE 插件）';
+      }
+      if (tk) {
+        if (token > 0) { tk.textContent = formatUsageTokens(token); tk.setAttribute('data-val', 'ok'); }
+        else { tk.textContent = '0.00'; tk.setAttribute('data-val', 'na'); }
+      }
+      var tkLabel = el.querySelector('.wbs-consumed-tk-lbl');
+      if (tkLabel) {
+        tkLabel.title = wbsUsageSource === 'ide' ? 'IDE 插件本地会话 token（含缓存）'
+          : wbsUsageSource === 'wb' ? 'WorkBuddy 桌面端 token'
+          : '桌面端 + IDE 插件（IDE 含缓存 token）';
+      }
     }
 
     function nearestCreditExpiry(account) {
@@ -16800,6 +17259,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         updateCheckinCells(state.accounts);
         updateDailyProgressCells();
         state.accounts.forEach(function (account) { updateCreditCell(account.uid, account.credits, account.creditSegments); });
+        refreshPerCardUsage(list);
         return;
       }
       state.accountLayoutKey = layoutKey;
@@ -16845,9 +17305,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           '<div class="wbs-mi wbs-token-cell"><span class="wbs-lbl">有效期至</span><span class="wbs-val' + (ts.warn ? ' wbs-warn' : '') + '">' + esc(ts.label) + '</span></div>' +
           '</div>' +
           '<div class="wbs-credit-cell">' + creditBlockHtml(credits, a.creditSegments, a) + '</div>' +
+          perCardUsageLineHtml(a) +
           '</div>';
         list.appendChild(card);
       });
+      refreshPerCardUsage(list);
       applyAccountMask();
       // 切换按钮：两击确认（第一次点击进入确认态，3s 内再点才真正切换，防止误触）
       list.querySelectorAll('.wbs-acc-switch').forEach(function (btn) {
@@ -17697,6 +18159,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     });
     registerDisposer(function () { modelRateLimitObserver.destroy(); });
 
+    // 启动官方限流 banner 检测：banner 型限流原有检测链路（仅读 sessionStore.error/warning）读不到，
+    // 单独补一路 DOM 观察，命中后复用 acRecordModelRateLimit 落库并实时刷新徽章/弹窗。
+    try {
+      var wbsBannerRateLimitDisposer = setupOfficialRateLimitBannerWatch();
+      registerDisposer(function () { try { if (wbsBannerRateLimitDisposer) wbsBannerRateLimitDisposer(); } catch (_) {} });
+    } catch (e) {}
+
     // 注入完成即按开关状态启动/停止监控（不依赖打开增强面板）
     try { ensureAutoContinueMonitor(); } catch (e) {}
     // 注入完成即同步会话模块状态（暂存/快捷短语开关 + 短语列表）并应用到输入框按钮显隐
@@ -17755,7 +18224,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-root{position:fixed;right:22px;bottom:22px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;color:#1f1f1f;-webkit-font-smoothing:antialiased}',
     '.wbs-root,.wbs-status-popover,.wbs-credit-summary-popover,#wbs-token-stats-modal{--wbs-primary:#22c55e;--wbs-primary-rgb:34,197,94;--wbs-primary-ink:#22c55e;--wbs-primary-soft:rgba(34,197,94,.09);--wbs-primary-soft-hover:rgba(34,197,94,.14);--wbs-series-2:#2563eb;--wbs-series-3:#d2760f;--wbs-series-4:#c026d3;--wbs-series-5:#0d9488;--wbs-series-6:#dc2626;--wbs-series-7:#7c3aed;--wbs-series-8:#7a9c1e;--wbs-series-9:#0891b2;--wbs-series-10:#7c2d12;--wbs-series-11:#db2777;--wbs-series-12:#57534e}',
     'html[data-wbs-theme-id="dark"] .wbs-root,html[data-wbs-theme-id="dark"] .wbs-status-popover,html[data-wbs-theme-id="dark"] .wbs-credit-summary-popover,html[data-wbs-theme-id="dark"] #wbs-token-stats-modal,html[data-wbs-theme-id="cyber-purple"] .wbs-root,html[data-wbs-theme-id="cyber-purple"] .wbs-status-popover,html[data-wbs-theme-id="cyber-purple"] .wbs-credit-summary-popover,html[data-wbs-theme-id="cyber-purple"] #wbs-token-stats-modal,html[data-wbs-theme-id="nebula"] .wbs-root,html[data-wbs-theme-id="nebula"] .wbs-status-popover,html[data-wbs-theme-id="nebula"] .wbs-credit-summary-popover,html[data-wbs-theme-id="nebula"] #wbs-token-stats-modal,:is(html[data-theme="dark"],html.cb-dark,body[data-vscode-theme-name*="dark" i]) .wbs-root,:is(html[data-theme="dark"],html.cb-dark,body[data-vscode-theme-name*="dark" i]) .wbs-status-popover,:is(html[data-theme="dark"],html.cb-dark,body[data-vscode-theme-name*="dark" i]) .wbs-credit-summary-popover,:is(html[data-theme="dark"],html.cb-dark,body[data-vscode-theme-name*="dark" i]) #wbs-token-stats-modal{--wbs-primary:#7f77dd;--wbs-primary-rgb:127,119,221;--wbs-primary-ink:#7f77dd;--wbs-primary-soft:rgba(127,119,221,.12);--wbs-primary-soft-hover:rgba(127,119,221,.18);--wbs-series-2:#62a8ff;--wbs-series-3:#f0a347;--wbs-series-4:#d959e8;--wbs-series-5:#3ff3e3;--wbs-series-6:#e64c4c;--wbs-series-7:#9a63f7;--wbs-series-8:#b6de5a;--wbs-series-9:#38d4fa;--wbs-series-10:#c9805c;--wbs-series-11:#f071a8;--wbs-series-12:#9f9a93}',
-    '.wbs-session-usage-summary{position:fixed;z-index:20;display:flex;align-items:center;justify-content:flex-start;gap:10px;box-sizing:border-box;min-height:37px;padding:3px 0 2px;border:0;border-radius:0;background:transparent;color:var(--wb-color-text-primary,#1f1f1f);font-size:14px;font-weight:400;line-height:18px;outline:none;cursor:pointer}',
+    '.wbs-session-usage-summary{position:relative;z-index:20;flex:0 0 auto;display:flex;align-items:center;justify-content:flex-start;gap:10px;box-sizing:border-box;min-height:37px;padding:3px 0 2px;border:0;border-radius:0;background:transparent;color:var(--wb-color-text-primary,#1f1f1f);font-size:14px;font-weight:400;line-height:18px;outline:none;cursor:pointer}',
+    '.wbs-session-usage-summary.is-fixed{position:fixed}',
     '.wbs-session-usage-summary:hover,.wbs-session-usage-summary:focus-visible{background:transparent}',
     '.wbs-session-usage-summary.is-hidden{visibility:hidden;opacity:0;pointer-events:none}',
     '.wbs-session-usage-main{display:flex;align-items:center;justify-content:flex-start;gap:9px;min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;text-align:left;white-space:nowrap;color:var(--wb-color-text-secondary,#68686d);opacity:1}',
@@ -17909,7 +18379,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     /* 面板：毛玻璃主题（半透明 + 模糊，背景图透出） */
     // 毛玻璃让官方按钮底色透明；面板内的选中态、开关和操作按钮仍需深色主题的对比色。
     'html[data-wbs-theme-id="nebula"] .wbs-panel,html[data-wbs-theme-id="nebula"] .wbs-modal,html[data-wbs-theme-id="nebula"] .wbs-account-note-popover,html[data-wbs-theme-id="nebula"] .wbs-status-popover,html[data-wbs-theme-id="nebula"] .wbs-credit-rotation-notice{--wb-button-primary-bg:var(--wb-palette-white-90);--wb-button-primary-fg:var(--wb-bg-primary)}',
-    '.wbs-panel{position:absolute;right:0;bottom:0;width:720px;max-width:94vw;height:650px;max-height:calc(100vh - 110px);background:color-mix(in srgb,var(--wb-bg-popover,#fff) 72%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.28);display:none;flex-direction:column;overflow:hidden;backdrop-filter:blur(28px) saturate(1.25);-webkit-backdrop-filter:blur(28px) saturate(1.25)}',
+    '.wbs-panel{position:absolute;right:0;bottom:0;width:880px;max-width:94vw;height:820px;max-height:calc(100vh - 48px);background:color-mix(in srgb,var(--wb-bg-popover,#fff) 72%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.28);display:none;flex-direction:column;overflow:hidden;backdrop-filter:blur(28px) saturate(1.25);-webkit-backdrop-filter:blur(28px) saturate(1.25)}',
     '.wbs-panel.show{display:flex}',
     '.wbs-root.wbs-panel-light,[data-wbs-appearance="light"]{color-scheme:light;--wb-bg-primary:#fff;--wb-bg-secondary:#fff;--wb-bg-tertiary:#f2f2f2;--wb-bg-popover:#fff;--wb-bg-input:#fff;--wb-bg-hover:#f5f5f5;--wb-bg-active:#eee;--wb-border-subtle:#f0f0f0;--wb-border-default:#e5e5e5;--wb-border-hover:#ccc;--wb-border-strong:#ccc;--wb-color-text-primary:#1f1f1f;--wb-color-text-secondary:#666;--wb-color-text-tertiary:#999;--wb-icon-secondary:#666;--wb-icon-tertiary:#999;--wb-button-primary-bg:#1f1f1f;--wb-button-primary-fg:#fff;--wb-button-primary-bg-hover:#333;--wb-button-primary-bg-disabled:#eee;--wb-button-primary-fg-disabled:#999}',
     '.wbs-panel-light .wbs-panel{background:var(--wb-bg-popover);color:var(--wb-color-text-primary)}',
@@ -17917,7 +18387,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 组件变量，否则宿主的深色文字规则会落在浅色面板上，形成白底浅字。
     ':is(html.cb-dark,html[data-theme="dark"],body[data-vscode-theme-name*="dark" i],body[data-vscode-theme-name*="night" i]) :is(.wbs-root[data-wbs-profile="codebuddy-cn"],.wbs-root[data-wbs-profile="codebuddy-intl"]){color-scheme:dark;--wb-bg-primary:#0a0a0c;--wb-bg-secondary:#131316;--wb-bg-tertiary:#1b1b20;--wb-bg-popover:#131316;--wb-bg-input:#131316;--wb-bg-hover:color-mix(in srgb,#ffffff 7%,transparent);--wb-bg-active:color-mix(in srgb,#ffffff 10%,transparent);--wb-border-subtle:#202025;--wb-border-default:color-mix(in srgb,#ffffff 13%,transparent);--wb-border-hover:color-mix(in srgb,#ffffff 22%,transparent);--wb-border-strong:#2c2c33;--wb-color-text-primary:#e6e6e9;--wb-color-text-secondary:rgba(230,230,233,.72);--wb-color-text-tertiary:rgba(230,230,233,.55);--wb-icon-secondary:rgba(230,230,233,.72);--wb-icon-tertiary:rgba(230,230,233,.55);--wb-button-primary-bg:rgba(255,255,255,.92);--wb-button-primary-fg:#0a0a0c;--wb-button-primary-bg-hover:rgba(255,255,255,.8);--wb-button-primary-bg-disabled:rgba(230,230,233,.18);--wb-button-primary-fg-disabled:rgba(230,230,233,.42)}',
     // 英文文案更长：英文面板额外加宽，配合 label 自适应避免挤压
-    'html[data-wbs-language="en"] .wbs-panel{width:880px}',
+    'html[data-wbs-language="en"] .wbs-panel{width:1000px}',
     // EN 下固定宽度 label 容易溢出：phone/credit/token 列的 label 释放为自适应宽度
     'html[data-wbs-language="en"] .wbs-phone-cell .wbs-lbl,html[data-wbs-language="en"] .wbs-credit-left .wbs-lbl{width:auto;max-width:84px}',
     'html[data-wbs-language="en"] .wbs-token-cell .wbs-lbl{width:auto;max-width:96px}',
@@ -17941,7 +18411,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-pick-btn:hover{background:color-mix(in srgb,var(--wb-accent-blue,#4f86ff) 24%,transparent)}',
     '.wbs-btn-close{position:relative;z-index:1;border:none;background:none;color:var(--wb-icon-tertiary,#999);font-size:16px;cursor:pointer;padding:4px 6px;border-radius:6px;line-height:1}',
     '.wbs-btn-close:hover{color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-hover,#f5f5f5)}',
-    '.wbs-body{overflow-y:auto;padding:10px 10px 6px;flex:1;min-height:0;height:calc(650px - 170px);max-height:none}',
+    '.wbs-body{overflow-y:auto;padding:10px 10px 6px;flex:1;min-height:0;height:calc(820px - 170px);max-height:none}',
     /* 账号卡片：头像 + 信息 + 右侧操作 */
     '.wbs-card{display:block;position:relative;padding:10px 12px;border-radius:12px;margin-bottom:4px;transition:background .12s}',
     '.wbs-card:hover{background:var(--wb-bg-hover,#f7f8fa)}',
@@ -18000,6 +18470,24 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-credit-cell{display:block!important;width:100%;min-width:0}',
     '.wbs-credit-hidden{display:none!important}',
     '.wbs-credit-block{width:100%;min-width:0}',
+    '.wbs-usage-src-inline{margin:0;align-self:center;padding:1px;gap:1px}',
+    '.wbs-usage-src-inline .wbs-usage-src-btn{font-size:10px;padding:0 6px;line-height:1.6}',
+    '.wbs-usage-line{display:flex;flex-direction:column;gap:2px;margin-top:6px;color:var(--wb-icon-tertiary,#999);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums}',
+    '.wbs-usage-src{display:inline-flex;align-items:center;gap:2px;padding:2px;margin:0 0 1px;border-radius:8px;background:color-mix(in srgb,var(--wb-icon-tertiary,#999) 12%,transparent);align-self:flex-start}',
+    '.wbs-usage-src-btn{appearance:none;border:0;background:transparent;color:var(--wb-icon-tertiary,#999);font-family:inherit;font-size:11px;line-height:1.5;padding:1px 7px;border-radius:6px;cursor:pointer;white-space:nowrap;transition:background .15s,color .15s}',
+    '.wbs-usage-src-btn:hover{color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-usage-src-btn.is-active{background:var(--wb-bg-primary,#fff);color:var(--wb-color-text-primary,#1f1f1f);font-weight:700;box-shadow:0 1px 2px rgba(0,0,0,.08)}',
+    'html.cb-dark .wbs-usage-src,html[data-theme="dark"] .wbs-usage-src{background:color-mix(in srgb,#fff 12%,transparent)}',
+    'html.cb-dark .wbs-usage-src-btn,html[data-theme="dark"] .wbs-usage-src-btn{color:#9aa0aa}',
+    'html.cb-dark .wbs-usage-src-btn.is-active,html[data-theme="dark"] .wbs-usage-src-btn.is-active{background:color-mix(in srgb,#fff 18%,transparent);color:#f3f5fa}',
+    '.wbs-usage-row{display:flex;align-items:baseline;gap:3px;flex-wrap:wrap}',
+    '.wbs-usage-lbl{color:var(--wb-icon-tertiary,#999)}',
+    '.wbs-usage-val{color:var(--wb-color-text-primary,#1f1f1f);font-weight:700}',
+    '.wbs-usage-tag{color:var(--wb-icon-tertiary,#999);font-weight:400;font-size:11px}',
+    'html.cb-dark .wbs-usage-line,html[data-theme="dark"] .wbs-usage-line{color:#9aa0aa}',
+    'html.cb-dark .wbs-usage-val,html[data-theme="dark"] .wbs-usage-val{color:#f3f5fa}',
+    'html.cb-dark .wbs-usage-lbl,html.cb-dark .wbs-usage-tag,html[data-theme="dark"] .wbs-usage-lbl,html[data-theme="dark"] .wbs-usage-tag{color:#9aa0aa}',
+    '.wbs-usage-val[data-val="pending"]{font-weight:400;color:var(--wb-icon-tertiary,#999)}',
     '.wbs-credit-line{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px;min-width:0}',
     '.wbs-credit-left{display:inline-flex;align-items:center;gap:4px;min-width:0}',
     '.wbs-credit-total{display:inline-flex;align-items:center;gap:4px;color:var(--wb-color-text-primary,#1f1f1f);font-size:12px;font-variant-numeric:tabular-nums}',
@@ -18622,7 +19110,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-enh-row{display:flex;gap:8px;margin-bottom:8px}',
     '.wbs-enh-tip{font-size:11px;color:var(--wb-icon-tertiary,#999);line-height:1.5;padding:4px 2px 0}',
     /* 账号列表容器 + 退出按钮 */
-    '.wbs-acct-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px 9px;border-bottom:1px solid var(--wb-border-subtle,#f0f0f0);background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 25%,transparent);flex-shrink:0}',
+    '.wbs-acct-toolbar-row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex:1 1 100%;min-width:0}',
+    '.wbs-acct-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 14px;border-bottom:1px solid var(--wb-border-subtle,#f0f0f0);background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 25%,transparent);flex-shrink:0;flex-wrap:wrap}',
     '#wbs-account-order-mask{pointer-events:auto;overscroll-behavior:contain}',
     '.wbs-account-order-modal{box-sizing:border-box;width:380px;max-width:calc(100% - 28px);max-height:calc(100% - 28px);display:flex;flex-direction:column;overflow:auto;gap:0}.wbs-account-order-modal>.wbs-modal-title{margin-bottom:3px}',
     '.wbs-account-settings-section{margin:14px 0 7px;padding-bottom:5px;border-bottom:1px solid var(--wb-border-subtle,#eee);font-size:11px;font-weight:650;line-height:1.35;color:var(--wb-color-text-secondary,#666)}.wbs-account-order-modal>.wbs-modal-title+.wbs-account-settings-section{margin-top:2px}',
@@ -18642,7 +19131,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     ':is(.wbs-credit-summary-popover,.wbs-credit-summary-chart)::-webkit-scrollbar{width:6px}:is(.wbs-credit-summary-popover,.wbs-credit-summary-chart)::-webkit-scrollbar-track,:is(.wbs-credit-summary-popover,.wbs-credit-summary-chart)::-webkit-scrollbar-thumb{background:transparent}:is(.wbs-credit-summary-popover,.wbs-credit-summary-chart)::-webkit-scrollbar-thumb{border-radius:6px}:is(.wbs-credit-summary-popover,.wbs-credit-summary-chart).is-scrolling{scrollbar-color:var(--wb-icon-secondary,#72757d) transparent}:is(.wbs-credit-summary-popover,.wbs-credit-summary-chart).is-scrolling::-webkit-scrollbar-thumb{background:var(--wb-icon-secondary,#72757d)}',
     'html.cb-dark .wbs-credit-summary-popover,html[data-theme="dark"] .wbs-credit-summary-popover,body[data-vscode-theme-name="IDE Night"] .wbs-credit-summary-popover{background:var(--wb-bg-popover,var(--wb-bg-primary));color:var(--wb-color-text-primary);border-color:var(--wb-border-default)}',
     '@media(max-width:600px){.wbs-acct-toolbar{flex-wrap:wrap;gap:8px}.wbs-acct-summary{flex-wrap:wrap}.wbs-acct-actions{margin-left:auto}}',
-    '.wbs-acct-summary{display:flex;align-items:center;gap:12px;min-width:0}.wbs-acct-summary>[data-act="model-rate-limit-summary"]{margin-left:-7px}',
+    '.wbs-acct-summary{display:flex;align-items:center;gap:12px;min-width:0;flex-shrink:0}.wbs-acct-summary>[data-act="model-rate-limit-summary"]{margin-left:-7px}',
     '.wbs-acct-eye{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:none;border-radius:6px;background:transparent;color:var(--wb-icon-secondary,var(--wb-color-text-secondary,#666));cursor:pointer;flex-shrink:0;transition:color .15s,background-color .15s}',
     '.wbs-acct-eye:hover{background:var(--wb-bg-hover,#f0f0f0);color:var(--wb-color-text,#222)}',
     '.wbs-acct-eye:active{transform:scale(.94)}',
@@ -18652,12 +19141,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-acct-stat span{color:var(--wb-icon-tertiary,#999);font-weight:500}',
     '.wbs-acct-stat strong{color:var(--wb-color-text-primary,#1f1f1f);font-weight:700;font-variant-numeric:tabular-nums}',
     '.wbs-acct-stat-divider{width:1px;height:18px;background:var(--wb-border-subtle,#e8e8e8);flex-shrink:0}',
-    '.wbs-acct-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}',
+    '.wbs-acct-consumed-stat .wbs-consumed-ci,.wbs-acct-consumed-stat .wbs-consumed-tk{font-weight:700;color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-acct-consumed-stat .wbs-consumed-ci[data-val="pending"],.wbs-acct-consumed-stat .wbs-consumed-tk[data-val="pending"]{font-weight:400;color:var(--wb-icon-tertiary,#999)}',
+    'html.cb-dark .wbs-acct-consumed-stat .wbs-consumed-ci,html[data-theme="dark"] .wbs-acct-consumed-stat .wbs-consumed-ci,html.cb-dark .wbs-acct-consumed-stat .wbs-consumed-tk,html[data-theme="dark"] .wbs-acct-consumed-stat .wbs-consumed-tk{color:var(--wb-color-text-primary,#f3f5fa)}',
+    '.wbs-acct-actions{display:flex;align-items:center;gap:2px;flex-shrink:0;margin-left:auto;background:var(--wb-bg-tertiary,#f4f5f6);border:1px solid var(--wb-border-subtle,#ececec);border-radius:10px;padding:4px}',
     '.wbs-acct-io{display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:5px 8px;border:1px solid var(--wb-border-subtle,#e6e6e6);border-radius:7px;background:var(--wb-bg-tertiary,#fafafa);color:var(--wb-color-text-secondary,#555);font-size:11px;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit;min-width:0;line-height:1.2}',
     '.wbs-acct-io:hover{background:var(--wb-bg-hover,#f0f0f0);border-color:var(--wb-border-default,#d5d5d5)}',
     '.wbs-acct-io svg{flex-shrink:0}',
     '.wbs-acct-io span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
     '.wbs-acct-icon{width:28px;height:28px;padding:0;border-radius:8px}',
+    '.wbs-acct-actions .wbs-acct-io{border:none;background:transparent;box-shadow:none}.wbs-acct-actions .wbs-acct-io:hover{background:var(--wb-bg-hover,#e8e9eb)}',
+    '.wbs-consumed-wrap{display:inline-flex;align-items:baseline;gap:8px}',
+    '.wbs-consumed-item{display:inline-flex;align-items:baseline;gap:3px}',
+    '.wbs-consumed-item i{font-style:normal;font-size:11px;color:var(--wb-color-text-tertiary,#9aa0a6);font-weight:400}',
+    '.wbs-consumed-sep{color:var(--wb-border-default,#cfcfcf)}',
+    '.wbs-acct-icon.wbs-spin svg{animation:wbs-acct-spin .8s linear infinite;transform-origin:center}',
+    '@keyframes wbs-acct-spin{to{transform:rotate(360deg)}}',
     '.wbs-acct-list{flex:1;min-height:0;overflow-y:auto;padding-right:2px}',
     '.wbs-logout-btn{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;margin-top:10px;padding:10px 0;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:12px;background:transparent;color:var(--wb-icon-secondary,#666);font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit;flex-shrink:0}',
     '.wbs-logout-btn:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f);border-color:var(--wb-border-default,#d5d5d5)}',

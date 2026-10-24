@@ -213,8 +213,75 @@ async function fetchUsageSinceAnchor(options = {}) {
   throw new Error(`官方用量分页不完整: 超过 ${maxPages} 页`);
 }
 
+// 全量扫描某账号的官方用量明细（累计全部）。
+//
+// 与 fetchUsageSinceAnchor 不同：后者信任服务端返回的 `total` 判断是否取完，
+// 但 `get-user-request-usage` 会把 total 与单页数据一起截断到 pageSize（实测
+// 恒为 3000），窗口内真实记录超过该值时 `total` 不可信，盲目信任会丢失超出
+// 部分。这里改用 workbuddy-switch official_usage.rs 的「取满即推进起点」扫法：
+// 每轮取满则说明区间内还有更多，把起点推进到本轮最新一条的时间戳（含边界去重）
+// 继续，直到某一轮取不满为止——从而拿回窗口内的全量明细，不依赖被截断的 total。
+async function fetchUsageFullScan(options = {}) {
+  const accessToken = String(options.accessToken || '');
+  const apiHost = String(options.apiHost || '').replace(/\/$/, '');
+  const startTime = options.startTime instanceof Date ? options.startTime : null;
+  const endTime = options.endTime instanceof Date ? options.endTime : null;
+  const pageSize = Number.isSafeInteger(options.pageSize) && options.pageSize > 0
+    ? options.pageSize
+    : 3000;
+  const maxRounds = Number.isSafeInteger(options.maxRounds) && options.maxRounds > 0
+    ? options.maxRounds
+    : 200;
+  const requestTimeoutMs = Number.isFinite(options.requestTimeoutMs) && options.requestTimeoutMs > 0
+    ? Number(options.requestTimeoutMs)
+    : DEFAULT_REQUEST_TIMEOUT_MS;
+  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  if (!accessToken || !apiHost || !startTime || !endTime || typeof fetchImpl !== 'function') {
+    throw new Error('官方用量全量扫描参数不完整');
+  }
+  if (startTime.getTime() > endTime.getTime()) throw new Error('官方用量查询时间范围无效');
+
+  const records = [];
+  const seen = new Set();
+  let start = startTime;
+  let previousNewest = null;
+  let completedRounds = 0;
+  for (let round = 1; round <= maxRounds; round++) {
+    completedRounds = round;
+    const page = await fetchUsagePage({
+      accessToken,
+      apiHost,
+      startTime: start,
+      endTime,
+      pageNum: 1,
+      pageSize,
+      fetchImpl,
+      requestTimeoutMs,
+    });
+    if (!page.rows.length) break;
+    let newest = -Infinity;
+    for (const raw of page.rows) {
+      const record = normalizeUsageRow(raw);
+      const dedupKey = `${record.requestId}@${record.requestTime}`;
+      if (!seen.has(dedupKey)) {
+        seen.add(dedupKey);
+        records.push(record);
+      }
+      if (record.requestTime > newest) newest = record.requestTime;
+    }
+    if (page.rows.length < pageSize) break; // 没取满：区间内记录已取完
+    if (!Number.isFinite(newest) || (previousNewest !== null && newest <= previousNewest)) {
+      break; // 起点无法继续前进（记录挤在同一时间戳）：保活已取到数据，停止
+    }
+    start = new Date(newest + 1); // 含边界去重，从最新一条之后继续扫
+    previousNewest = newest;
+  }
+  return { records, rounds: completedRounds };
+}
+
 module.exports = {
   fetchUsageSinceAnchor,
+  fetchUsageFullScan,
   formatLocalDateTime,
   normalizeUsageRow,
   usageModel,

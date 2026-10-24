@@ -30,3 +30,4 @@ scripts/picker-internal.js
 
 # 构建缓存(安装器临时产物)
 release/.cache/
+.idea/
