@@ -23,6 +23,13 @@ function validIdentity(value, label) {
   return text;
 }
 
+// 同一模型可能由不同上报路径写成只差分隔符/大小写的 model_id
+// （Step-5-Preview / step-5-preview、Hy4 preview / Hy4-preview），
+// 只按小写去重会把它们当成两个模型，界面出现重复行。
+function normalizeModelKey(modelId) {
+  return String(modelId || '').toLowerCase().replace(/[\s\-_./\\]+/g, '');
+}
+
 function localDayRange(date) {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ''));
   if (!match) throw new Error('用量日期无效');
@@ -577,13 +584,21 @@ function createCreditUsageStore(options = {}) {
     if (reset !== null && (!Number.isSafeInteger(reset) || reset < 0)) throw new Error('限流解封时间无效');
     const reason = reasonCode === null || reasonCode === undefined ? null : Number(reasonCode);
     if (reason !== null && !Number.isSafeInteger(reason)) throw new Error('限流 code 无效');
-    // 同一模型可能由不同上报路径写成仅大小写不同的 model_id（如 Step-5-Preview / step-5-preview），
-    // 主键区分大小写会落成两条重复行。写入前先清掉同账号的大小写变体，保证一个模型只留一条。
-    await db.run(
-      `DELETE FROM model_rate_limit_records
-       WHERE profile_id = ? AND uid = ? AND model_id <> ? AND lower(model_id) = lower(?)`,
-      [profileId, accountUid, id, id]
+    // 同一模型可能由不同上报路径写成仅分隔符/大小写不同的 model_id，主键区分大小写会落成两条重复行。
+    // 写入前先清掉同账号的等价变体，保证一个模型只留一条。
+    const targetKey = normalizeModelKey(id);
+    const existingIds = await db.all(
+      `SELECT model_id FROM model_rate_limit_records WHERE profile_id = ? AND uid = ?`,
+      [profileId, accountUid]
     );
+    for (const row of existingIds) {
+      const existingId = String(row.model_id || '');
+      if (existingId === id || normalizeModelKey(existingId) !== targetKey) continue;
+      await db.run(
+        `DELETE FROM model_rate_limit_records WHERE profile_id = ? AND uid = ? AND model_id = ?`,
+        [profileId, accountUid, existingId]
+      );
+    }
     await db.run(
       `INSERT INTO model_rate_limit_records
          (profile_id, uid, model_id, model_name, reset_at, observed_at, source, reason_code)
@@ -640,8 +655,8 @@ function createCreditUsageStore(options = {}) {
     const seen = new Set();
     for (const row of rows) {
       if (!accountUids.includes(row.uid)) continue;
-      // 兼容历史大小写重复：同一账号同一模型只保留最近观察的一条（rows 已按 observed_at DESC 排序）。
-      const dedupKey = row.uid + '|' + String(row.model_id).toLowerCase();
+      // 兼容历史重复：同一账号同一模型只保留最近观察的一条（rows 已按 observed_at DESC 排序）。
+      const dedupKey = row.uid + '|' + normalizeModelKey(row.model_id);
       if (seen.has(dedupKey)) continue;
       seen.add(dedupKey);
       if (!result[row.uid]) result[row.uid] = [];

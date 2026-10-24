@@ -149,3 +149,23 @@ test('detects an active matching model limit owned by another account', async (t
   assert.equal(await tmp.store.hasModelRateLimitElsewhere({ uid: 'u2', modelId: 'model-x', resetAt: 6000, now: 4000 }), false);
   assert.equal(await tmp.store.hasModelRateLimitElsewhere({ uid: 'u2', modelId: 'model-x', resetAt: 5000, now: 5000 }), false);
 });
+
+test('treats separator-only and case-only model id variants as one model', async (t) => {
+  const tmp = tempStore();
+  t.after(() => fs.rmSync(tmp.dir, { recursive: true, force: true }));
+
+  // 只差分隔符（空格 vs 连字符）
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'Hy4 preview', modelName: 'Hy4 preview', resetAt: 9000, observedAt: 1000, reasonCode: 6004, source: 'renderer-error' });
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'Hy4-preview', modelName: 'Hy4-preview', resetAt: 9000, observedAt: 2000, reasonCode: 6004, source: 'renderer-error' });
+  // 只差大小写
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'Step-5-Preview', modelName: 'Step-5-Preview', resetAt: 9000, observedAt: 1500, reasonCode: 6004, source: 'renderer-error' });
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'step-5-preview', modelName: 'step-5-preview', resetAt: 9000, observedAt: 2500, reasonCode: 6004, source: 'renderer-error' });
+
+  const limits = await tmp.store.listModelRateLimits(['u1'], 4000);
+  assert.equal(limits.u1.length, 2, '两个模型，各自只留一条');
+  const byKey = Object.fromEntries(limits.u1.map((row) => [row.modelId, row]));
+  assert.ok(byKey['Hy4-preview'], '保留最近观察的写法');
+  assert.ok(byKey['step-5-preview']);
+  assert.equal(byKey['Hy4 preview'], undefined);
+  assert.equal(byKey['Step-5-Preview'], undefined);
+});
