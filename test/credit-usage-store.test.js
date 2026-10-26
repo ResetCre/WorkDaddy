@@ -210,3 +210,21 @@ test('merges rate limits sharing the same reset time into one event', async (t) 
   assert.ok(!limits.u1.some((row) => row.modelId === 'hy3'));
   assert.ok(limits.u1.some((row) => row.modelId === 'hy4-preview'));
 });
+
+test('prefers a used model name when merging one rate limit event', async (t) => {
+  const tmp = tempStore();
+  t.after(() => fs.rmSync(tmp.dir, { recursive: true, force: true }));
+
+  // 确实用过的模型是 hy3（用量时间早于限流观察，不会被判为已恢复）
+  await tmp.store.savePolledUsage('u1', [{
+    requestId: 'r1', requestTime: 900, usageDate: '2026-10-26', credit: 1,
+    model: 'hy3', client: 'WorkBuddy', agentPurpose: '',
+  }]);
+  // 同一次限流被上报成两个名字，fast-model 观察时间更晚但从未用过
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'hy3', modelName: 'hy3', resetAt: 9000, observedAt: 1000, reasonCode: 6004, source: 'renderer-error' });
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'fast-model', modelName: 'fast-model', resetAt: 9000, observedAt: 2000, reasonCode: 6004, source: 'renderer-error' });
+
+  const limits = await tmp.store.listModelRateLimits(['u1'], 4000);
+  assert.equal(limits.u1.length, 1);
+  assert.equal(limits.u1[0].modelId, 'hy3', '应优先展示用过的模型名，而不是上报时的会话模型名');
+});

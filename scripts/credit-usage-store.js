@@ -652,14 +652,21 @@ function createCreditUsageStore(options = {}) {
       [profileId, ...accountUids]
     );
     const result = {};
-    const seen = new Set();
-    const seenReset = new Set();
     // 限流记录只有 reset_at 一个失效条件：模型其实已恢复（限流之后又成功用过），
     // 但 reset_at 还没到，界面就会一直挂着"限流中"。这里用成功用量反证恢复并清理。
     const recovered = new Set();
+    const usedKeys = new Set();
     if (rows.length) {
       const oldestObserved = rows.reduce((min, row) => Math.min(min, Number(row.observed_at) || 0), Number.MAX_SAFE_INTEGER);
-      const usageRows = await db.all(
+      const usedRows = await db.all(
+        `SELECT DISTINCT uid, model FROM credit_usage_records
+         WHERE profile_id = ? AND uid IN (${placeholders})`,
+        [profileId, ...accountUids]
+      );
+      for (const usage of usedRows) {
+        usedKeys.add(usage.uid + '|' + normalizeModelKey(usage.model));
+      }
+      const lastOkRows = await db.all(
         `SELECT uid, model, MAX(request_time) AS last_ok
          FROM credit_usage_records
          WHERE profile_id = ? AND uid IN (${placeholders}) AND request_time >= ?
@@ -667,7 +674,7 @@ function createCreditUsageStore(options = {}) {
         [profileId, ...accountUids, oldestObserved]
       );
       const lastOkByModel = new Map();
-      for (const usage of usageRows) {
+      for (const usage of lastOkRows) {
         lastOkByModel.set(usage.uid + '|' + normalizeModelKey(usage.model), Number(usage.last_ok) || 0);
       }
       for (const row of rows) {
@@ -680,20 +687,36 @@ function createCreditUsageStore(options = {}) {
         );
       }
     }
+    const seen = new Set();
+    // 同一 (uid, reset_at) 是同一次限流事件：上报时取的是当时会话的模型名，
+    // 于是一次限流会落成多条（fast-model / 快速 / hy3 …）。
+    // 合并成一个事件，并优先用「确实用过」的模型名做代表，其次取最近观察的。
+    const events = new Map();
+    const singles = [];
     for (const row of rows) {
       if (!accountUids.includes(row.uid)) continue;
       if (recovered.has(row.uid + '|' + row.model_id)) continue;
       // 兼容历史重复：同一账号同一模型只保留最近观察的一条（rows 已按 observed_at DESC 排序）。
       const dedupKey = row.uid + '|' + normalizeModelKey(row.model_id);
       if (seen.has(dedupKey)) continue;
-      // 同一次限流事件会被写成多条（上报时取的是当时会话的模型名），
-      // reset_at 完全相同就按同一个事件处理，只留最近观察的一条。
-      if (row.reset_at !== null) {
-        const resetKey = row.uid + '|' + row.reset_at;
-        if (seenReset.has(resetKey)) continue;
-        seenReset.add(resetKey);
-      }
       seen.add(dedupKey);
+      if (row.reset_at === null) {
+        singles.push(row);
+        continue;
+      }
+      const eventKey = row.uid + '|' + row.reset_at;
+      const used = usedKeys.has(dedupKey);
+      const current = events.get(eventKey);
+      if (!current) {
+        events.set(eventKey, { row: row, used: used });
+      } else if (used && !current.used) {
+        events.set(eventKey, { row: row, used: used });
+      }
+    }
+    const picked = Array.from(events.values(), (item) => item.row)
+      .concat(singles)
+      .sort((a, b) => (Number(b.observed_at) || 0) - (Number(a.observed_at) || 0));
+    for (const row of picked) {
       if (!result[row.uid]) result[row.uid] = [];
       result[row.uid].push({
         modelId: String(row.model_id), modelName: String(row.model_name || ''),
