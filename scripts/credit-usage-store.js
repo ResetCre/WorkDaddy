@@ -653,11 +653,46 @@ function createCreditUsageStore(options = {}) {
     );
     const result = {};
     const seen = new Set();
+    const seenReset = new Set();
+    // 限流记录只有 reset_at 一个失效条件：模型其实已恢复（限流之后又成功用过），
+    // 但 reset_at 还没到，界面就会一直挂着"限流中"。这里用成功用量反证恢复并清理。
+    const recovered = new Set();
+    if (rows.length) {
+      const oldestObserved = rows.reduce((min, row) => Math.min(min, Number(row.observed_at) || 0), Number.MAX_SAFE_INTEGER);
+      const usageRows = await db.all(
+        `SELECT uid, model, MAX(request_time) AS last_ok
+         FROM credit_usage_records
+         WHERE profile_id = ? AND uid IN (${placeholders}) AND request_time >= ?
+         GROUP BY uid, model`,
+        [profileId, ...accountUids, oldestObserved]
+      );
+      const lastOkByModel = new Map();
+      for (const usage of usageRows) {
+        lastOkByModel.set(usage.uid + '|' + normalizeModelKey(usage.model), Number(usage.last_ok) || 0);
+      }
+      for (const row of rows) {
+        const lastOk = lastOkByModel.get(row.uid + '|' + normalizeModelKey(row.model_id)) || 0;
+        if (!lastOk || lastOk <= (Number(row.observed_at) || 0)) continue;
+        recovered.add(row.uid + '|' + row.model_id);
+        await db.run(
+          `DELETE FROM model_rate_limit_records WHERE profile_id = ? AND uid = ? AND model_id = ?`,
+          [profileId, row.uid, row.model_id]
+        );
+      }
+    }
     for (const row of rows) {
       if (!accountUids.includes(row.uid)) continue;
+      if (recovered.has(row.uid + '|' + row.model_id)) continue;
       // 兼容历史重复：同一账号同一模型只保留最近观察的一条（rows 已按 observed_at DESC 排序）。
       const dedupKey = row.uid + '|' + normalizeModelKey(row.model_id);
       if (seen.has(dedupKey)) continue;
+      // 同一次限流事件会被写成多条（上报时取的是当时会话的模型名），
+      // reset_at 完全相同就按同一个事件处理，只留最近观察的一条。
+      if (row.reset_at !== null) {
+        const resetKey = row.uid + '|' + row.reset_at;
+        if (seenReset.has(resetKey)) continue;
+        seenReset.add(resetKey);
+      }
       seen.add(dedupKey);
       if (!result[row.uid]) result[row.uid] = [];
       result[row.uid].push({

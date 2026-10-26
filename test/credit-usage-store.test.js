@@ -157,9 +157,9 @@ test('treats separator-only and case-only model id variants as one model', async
   // 只差分隔符（空格 vs 连字符）
   await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'Hy4 preview', modelName: 'Hy4 preview', resetAt: 9000, observedAt: 1000, reasonCode: 6004, source: 'renderer-error' });
   await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'Hy4-preview', modelName: 'Hy4-preview', resetAt: 9000, observedAt: 2000, reasonCode: 6004, source: 'renderer-error' });
-  // 只差大小写
-  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'Step-5-Preview', modelName: 'Step-5-Preview', resetAt: 9000, observedAt: 1500, reasonCode: 6004, source: 'renderer-error' });
-  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'step-5-preview', modelName: 'step-5-preview', resetAt: 9000, observedAt: 2500, reasonCode: 6004, source: 'renderer-error' });
+  // 只差大小写（用不同 reset，避免和上面被当成同一次限流事件）
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'Step-5-Preview', modelName: 'Step-5-Preview', resetAt: 8500, observedAt: 1500, reasonCode: 6004, source: 'renderer-error' });
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'step-5-preview', modelName: 'step-5-preview', resetAt: 8500, observedAt: 2500, reasonCode: 6004, source: 'renderer-error' });
 
   const limits = await tmp.store.listModelRateLimits(['u1'], 4000);
   assert.equal(limits.u1.length, 2, '两个模型，各自只留一条');
@@ -168,4 +168,45 @@ test('treats separator-only and case-only model id variants as one model', async
   assert.ok(byKey['step-5-preview']);
   assert.equal(byKey['Hy4 preview'], undefined);
   assert.equal(byKey['Step-5-Preview'], undefined);
+});
+
+test('drops a rate limit once that model has succeeded again', async (t) => {
+  const tmp = tempStore();
+  t.after(() => fs.rmSync(tmp.dir, { recursive: true, force: true }));
+
+  // 成功用量发生在限流观察之后 → 说明已恢复
+  await tmp.store.savePolledUsage('u1', [{
+    requestId: 'r1', requestTime: 2000, usageDate: '2026-10-26', credit: 1,
+    model: 'Hy4-preview', client: 'WorkBuddy', agentPurpose: '',
+  }]);
+  await tmp.store.saveModelRateLimit({
+    uid: 'u1', modelId: 'Hy4 preview', modelName: 'Hy4 preview',
+    resetAt: 900000, observedAt: 1000, reasonCode: 6004, source: 'renderer-error',
+  });
+  assert.equal((await tmp.store.listModelRateLimits(['u1'], 4000)).u1, undefined, '恢复后不再显示');
+
+  // 再次限流（观察时间晚于最后一次成功）→ 继续显示
+  await tmp.store.saveModelRateLimit({
+    uid: 'u1', modelId: 'Hy4 preview', modelName: 'Hy4 preview',
+    resetAt: 900000, observedAt: 3000, reasonCode: 6004, source: 'renderer-error',
+  });
+  const active = await tmp.store.listModelRateLimits(['u1'], 4000);
+  assert.equal(active.u1.length, 1);
+  assert.equal(active.u1[0].modelId, 'Hy4 preview');
+});
+
+test('merges rate limits sharing the same reset time into one event', async (t) => {
+  const tmp = tempStore();
+  t.after(() => fs.rmSync(tmp.dir, { recursive: true, force: true }));
+
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'hy3', modelName: 'hy3', resetAt: 9000, observedAt: 1000, reasonCode: 6004, source: 'renderer-error' });
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'fast-model', modelName: 'fast-model', resetAt: 9000, observedAt: 2000, reasonCode: 6004, source: 'renderer-error' });
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: '快速', modelName: '快速', resetAt: 9000, observedAt: 2000, reasonCode: 6004, source: 'renderer-error' });
+  await tmp.store.saveModelRateLimit({ uid: 'u1', modelId: 'hy4-preview', modelName: 'hy4-preview', resetAt: 8000, observedAt: 1500, reasonCode: 6004, source: 'renderer-error' });
+
+  const limits = await tmp.store.listModelRateLimits(['u1'], 4000);
+  assert.equal(limits.u1.length, 2, '同一 reset 只留一条，不同 reset 各自保留');
+  assert.ok(limits.u1.some((row) => row.modelId === 'fast-model'), '保留 observed_at 最新的那条');
+  assert.ok(!limits.u1.some((row) => row.modelId === 'hy3'));
+  assert.ok(limits.u1.some((row) => row.modelId === 'hy4-preview'));
 });
