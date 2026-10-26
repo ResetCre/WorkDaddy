@@ -504,7 +504,9 @@ function createModelRateLimitObserver(options) {
       [state.error, state.warning].forEach(function (error) {
         var normalized = normalizeAutoContinueError(error);
         if (!normalized || !normalized.rateLimited) return;
-        var modelId = normalized.requestModelId || String(state.model || state.modelId || '');
+        // 只用错误自身携带的模型 ID。回退到 state.model 会把「当时会话选中的模型」
+        // 当成被限流的模型，产生用户从没用过的名字（fast-model / 快速 这类运行时别名）。
+        var modelId = String(normalized.requestModelId || '');
         if (!modelId) return;
         binding.latest = {
           conversationId: String(controller.conversationId || ''),

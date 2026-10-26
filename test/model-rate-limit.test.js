@@ -138,3 +138,23 @@ test('renderer cap cleanup calls the native timer API with a valid receiver', ()
   options.clearInterval(123);
   assert.notEqual(timerReceiver, options, 'native clearInterval rejects the observer options as its receiver');
 });
+
+test('does not attribute a rate limit to the session model when the error has no model id', () => {
+  const listeners = new Set();
+  let state = { model: 'fast-model' };
+  const controllers = [{ conversationId: 'c-no-model', sessionStore: {
+    getState: () => state,
+    subscribe: fn => { listeners.add(fn); return () => listeners.delete(fn); },
+  } }];
+  const records = [];
+  inject.createModelRateLimitObserver({
+    discover: () => controllers,
+    record: value => records.push(value),
+    setInterval: () => 1,
+    clearInterval: () => {},
+  });
+  // 错误里没有 requestModelId：不能拿会话的 model（fast-model 这类运行时别名）顶替
+  state = { model: 'fast-model', error: { code: 6004, message: 'rate limit exceeded' } };
+  for (const fn of listeners) fn();
+  assert.equal(records.length, 0, '缺少模型 ID 时不应上报限流');
+});
